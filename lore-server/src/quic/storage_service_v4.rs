@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
+use lore_transport::StorageSessionStart;
 use lore_transport::quic::QuicOpCode;
 use lore_transport::quic::QuicServiceError;
 use lore_transport::quic::UnknownCommand;
@@ -201,7 +202,14 @@ impl QuicService for StorageServiceV4 {
                             correlation_id,
                             "Authorized session"
                         );
-                        let response_data = vec![Bytes::copy_from_slice(&session_id.to_le_bytes())];
+                        let start = if let Some(config) =
+                            self.immutable_store.public_object_read_config()
+                        {
+                            StorageSessionStart::public_http_hash_hex(session_id, config.base_url)
+                        } else {
+                            StorageSessionStart::server_stream(session_id)
+                        };
+                        let response_data = vec![start.encode_quic_v4()];
                         Ok(response_data)
                     }
                     Err(SessionError::LimitReached) => Err(MessageHandleError::SessionLimitReached),
@@ -447,6 +455,7 @@ impl QuicService for StorageServiceV4 {
 
 #[cfg(test)]
 mod tests {
+    use lore_transport::ImmutablePayloadReadMode;
     use lore_transport::quic::QuicServiceError;
     use rand::random;
 
@@ -454,6 +463,170 @@ mod tests {
     use crate::protocol::storage::session::MAX_CONCURRENT_SESSIONS;
     use crate::quic::QuicService;
     use crate::store::test_store_create;
+
+    struct PublicReadStore {
+        inner: Arc<dyn ImmutableStore>,
+        config: lore_storage::PublicObjectReadConfig,
+    }
+
+    impl PublicReadStore {
+        fn new(inner: Arc<dyn ImmutableStore>, base_url: &str) -> Self {
+            Self {
+                inner,
+                config: lore_storage::PublicObjectReadConfig::new(base_url),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ImmutableStore for PublicReadStore {
+        fn is_local(&self) -> bool {
+            self.inner.is_local()
+        }
+
+        fn public_object_read_config(&self) -> Option<lore_storage::PublicObjectReadConfig> {
+            Some(self.config.clone())
+        }
+
+        async fn is_available(self: Arc<Self>, timeout: std::time::Duration) -> bool {
+            self.inner.clone().is_available(timeout).await
+        }
+
+        async fn exist(
+            self: Arc<Self>,
+            partition: lore_base::types::Partition,
+            address: lore_base::types::Address,
+            match_requested: lore_storage::StoreMatch,
+        ) -> Result<lore_storage::StoreMatch, lore_storage::StoreError> {
+            self.inner
+                .clone()
+                .exist(partition, address, match_requested)
+                .await
+        }
+
+        async fn exist_batch(
+            self: Arc<Self>,
+            partition: lore_base::types::Partition,
+            addresses: &[lore_base::types::Address],
+            match_requested: lore_storage::StoreMatch,
+        ) -> Result<Vec<lore_storage::StoreMatch>, lore_storage::StoreError> {
+            self.inner
+                .clone()
+                .exist_batch(partition, addresses, match_requested)
+                .await
+        }
+
+        async fn query(
+            self: Arc<Self>,
+            partition: lore_base::types::Partition,
+            address: lore_base::types::Address,
+            match_requested: lore_storage::StoreMatch,
+        ) -> Result<lore_storage::StoreQueryResult, lore_storage::StoreError> {
+            self.inner
+                .clone()
+                .query(partition, address, match_requested)
+                .await
+        }
+
+        async fn get(
+            self: Arc<Self>,
+            partition: lore_base::types::Partition,
+            address: lore_base::types::Address,
+            match_required: lore_storage::StoreMatch,
+        ) -> Result<(lore_base::types::Fragment, Bytes), lore_storage::StoreError> {
+            self.inner
+                .clone()
+                .get(partition, address, match_required)
+                .await
+        }
+
+        async fn put(
+            self: Arc<Self>,
+            partition: lore_base::types::Partition,
+            address: lore_base::types::Address,
+            fragment: lore_base::types::Fragment,
+            payload: Option<Bytes>,
+            force: bool,
+        ) -> Result<(), lore_storage::StoreError> {
+            self.inner
+                .clone()
+                .put(partition, address, fragment, payload, force)
+                .await
+        }
+
+        async fn obliterate(
+            self: Arc<Self>,
+            partition: lore_base::types::Partition,
+            address: lore_base::types::Address,
+            stats: Arc<lore_storage::StoreObliterateStats>,
+        ) -> Result<(), lore_storage::StoreError> {
+            self.inner
+                .clone()
+                .obliterate(partition, address, stats)
+                .await
+        }
+
+        async fn evict(
+            self: Arc<Self>,
+            max_capacity: usize,
+            sync_data: bool,
+        ) -> Result<usize, lore_storage::StoreError> {
+            self.inner.clone().evict(max_capacity, sync_data).await
+        }
+
+        async fn compact(
+            self: Arc<Self>,
+            max_size: usize,
+            at: Option<usize>,
+            sync_data: bool,
+        ) -> Result<Option<usize>, lore_storage::StoreError> {
+            self.inner.clone().compact(max_size, at, sync_data).await
+        }
+
+        async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {
+            self.inner.clone().compact_resume_at().await
+        }
+
+        async fn compact_stop(self: Arc<Self>) {
+            self.inner.clone().compact_stop().await;
+        }
+
+        fn max_query_batch(&self) -> Option<usize> {
+            self.inner.max_query_batch()
+        }
+
+        async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), lore_storage::StoreError> {
+            self.inner.clone().flush(sync_data).await
+        }
+
+        async fn fragment_count(self: Arc<Self>) -> Option<usize> {
+            self.inner.clone().fragment_count().await
+        }
+
+        async fn verify(self: Arc<Self>, heal: bool) -> Result<(), lore_storage::StoreError> {
+            self.inner.clone().verify(heal).await
+        }
+
+        async fn copy(
+            self: Arc<Self>,
+            source_partition: lore_base::types::Partition,
+            source_address: lore_base::types::Address,
+            destination_partition: lore_base::types::Partition,
+            destination_context: lore_base::types::Context,
+            durable: bool,
+        ) -> Result<(), lore_storage::StoreError> {
+            self.inner
+                .clone()
+                .copy(
+                    source_partition,
+                    source_address,
+                    destination_partition,
+                    destination_context,
+                    durable,
+                )
+                .await
+        }
+    }
 
     /// Fill the session map to capacity then attempt one more `AuthorizeStart`,
     /// verifying the handler returns `SlowDown` and that `transform_protocol_error`
@@ -516,5 +689,51 @@ mod tests {
         assert_eq!(error_info.message_handle_label, "SessionLimitReached");
         assert!(!error_info.is_internal_error);
         assert!(!error_info.is_appropriate_for_logging);
+    }
+
+    #[tokio::test]
+    async fn authorize_start_advertises_public_http_read_capability() {
+        let (immutable_store, mutable_store, _execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let public_store = Arc::new(PublicReadStore::new(
+            immutable_store.clone(),
+            "https://objects.example.com/",
+        ));
+
+        let service = StorageServiceV4::new(
+            Arc::new(None),
+            public_store.clone(),
+            immutable_store.clone(),
+            mutable_store,
+        );
+
+        let response = service
+            .run_request_handler(
+                AttributeMap::default().into(),
+                ParsedStorageRequestV4::AuthorizeStart {
+                    repository: random::<lore_revision::lore::RepositoryId>(),
+                    correlation_id: "public-read-capability".into(),
+                    auth_token: vec![],
+                },
+            )
+            .await
+            .expect("authorize start succeeds");
+
+        assert_eq!(response.len(), 1);
+        let start =
+            StorageSessionStart::decode_quic_v4(&response[0]).expect("decode capability response");
+
+        match start.immutable_payload_read {
+            ImmutablePayloadReadMode::PublicHttp(config) => {
+                assert_eq!(config.base_url, "https://objects.example.com");
+                assert_eq!(
+                    config.key_scheme,
+                    lore_transport::PublicObjectKeyScheme::HashHex
+                );
+            }
+            other @ ImmutablePayloadReadMode::ServerStream => {
+                panic!("expected public HTTP capability, got {other:?}")
+            }
+        }
     }
 }

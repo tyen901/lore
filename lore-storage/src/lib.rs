@@ -20,6 +20,7 @@ pub mod maintenance;
 pub mod mutable_store;
 pub mod options;
 pub mod packstore;
+pub mod public_read;
 pub mod read;
 pub mod store_types;
 #[cfg(test)]
@@ -110,6 +111,8 @@ pub use options::WriteOptions;
 pub use packstore::PackStore;
 pub use packstore::PackStoreRef;
 pub use packstore::PackfileError;
+pub use public_read::PublicObjectReadConfig;
+pub use public_read::normalize_public_base_url;
 pub use read::REMOTE_FETCH_INFLIGHT;
 pub use read::decompress_and_verify;
 pub use read::load_fragment;

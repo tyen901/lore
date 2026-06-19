@@ -8,6 +8,7 @@ use bytes::Bytes;
 use lore_error_set::Internal;
 use lore_error_set::prelude::*;
 use lore_storage::immutable_store::sanitise_fragment_behavior_flags;
+use lore_storage::read::load_remote_raw_payload;
 use lore_transport::Admin;
 use lore_transport::Connection;
 use lore_transport::ProtocolError;
@@ -191,10 +192,11 @@ impl store::ImmutableStore for RemoteImmutableStore {
         let session = self.session(repository).await?;
         let status = session.query(&[address]).await.unwrap_or_default();
         if !status.is_empty() && status[0] == 0 {
-            let (fragment, _payload) = session
-                .get(&address)
+            let (fragment, _payload) = load_remote_raw_payload(session.as_ref(), address, false)
                 .await
-                .forward::<StoreError>("Remote store query failed")?;
+                .map_err(|err| {
+                    StoreError::internal_with_context(err, "Remote store query failed")
+                })?;
             Ok(StoreQueryResult {
                 fragment,
                 match_made: StoreMatch::MatchFull,
@@ -215,10 +217,9 @@ impl store::ImmutableStore for RemoteImmutableStore {
     ) -> Result<(Fragment, Bytes), StoreError> {
         let repository: RepositoryId = repository;
         let session = self.session(repository).await?;
-        let (fragment, payload) = session
-            .get(&address)
+        let (fragment, payload) = load_remote_raw_payload(session.as_ref(), address, false)
             .await
-            .forward::<StoreError>("Remote store get failed")?;
+            .map_err(|err| StoreError::internal_with_context(err, "Remote store get failed"))?;
         lore_storage::validate_fragment_payload(&fragment, payload.len())?;
         Ok((fragment, payload))
     }

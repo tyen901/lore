@@ -649,14 +649,26 @@ mod tests {
     use std::net::SocketAddr;
     use std::net::UdpSocket;
     use std::path::PathBuf;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
+    use async_trait::async_trait;
+    use bytes::Bytes;
     use lore_base::runtime::runtime;
+    use lore_base::types::Address;
     use lore_base::types::Context;
+    use lore_base::types::Fragment;
+    use lore_base::types::Partition;
     use lore_revision::fragment::generate_random;
     use lore_storage::ImmutableStore;
     use lore_storage::MutableStore;
+    use lore_storage::StoreError;
     use lore_storage::StoreMatch;
+    use lore_storage::StoreObliterateStats;
+    use lore_storage::StoreQueryResult;
+    use lore_transport::ImmutablePayloadReadMode;
+    use lore_transport::Storage;
     use lore_transport::quic::QuicOpCode;
     use lore_transport::quic::client::CertificateSettings;
     use lore_transport::quic::client::ClientCerts;
@@ -666,12 +678,14 @@ mod tests {
     use lore_transport::quic::client::TransportConfig;
     use lore_transport::quic::client::insecure_client_auth;
     use lore_transport::quic::storage_service::Command;
+    use lore_transport::quic::storage_service::client::StorageClient;
     use quinn::ClientConfig;
     use quinn::ConnectionError;
     use quinn::Endpoint;
     use quinn::ReadExactError;
     use quinn::crypto::rustls::QuicClientConfig;
     use rand::random;
+    use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
     use zerocopy::IntoBytes;
 
@@ -696,6 +710,225 @@ mod tests {
 
     const TEST_PROTOCOL: &str = "test/0.2";
     const TEST_PROTOCOL_V4: &str = "lore-storage/0.4";
+
+    struct PublicReadCountingStore {
+        inner: Arc<dyn ImmutableStore>,
+        public_read: lore_storage::PublicObjectReadConfig,
+        get_count: Arc<AtomicUsize>,
+    }
+
+    impl PublicReadCountingStore {
+        fn new(
+            inner: Arc<dyn ImmutableStore>,
+            public_base_url: String,
+            get_count: Arc<AtomicUsize>,
+        ) -> Self {
+            Self {
+                inner,
+                public_read: lore_storage::PublicObjectReadConfig::new(public_base_url),
+                get_count,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ImmutableStore for PublicReadCountingStore {
+        fn is_local(&self) -> bool {
+            self.inner.is_local()
+        }
+
+        fn public_object_read_config(&self) -> Option<lore_storage::PublicObjectReadConfig> {
+            Some(self.public_read.clone())
+        }
+
+        async fn is_available(self: Arc<Self>, timeout: Duration) -> bool {
+            self.inner.clone().is_available(timeout).await
+        }
+
+        async fn exist(
+            self: Arc<Self>,
+            partition: Partition,
+            address: Address,
+            match_requested: StoreMatch,
+        ) -> Result<StoreMatch, StoreError> {
+            self.inner
+                .clone()
+                .exist(partition, address, match_requested)
+                .await
+        }
+
+        async fn exist_batch(
+            self: Arc<Self>,
+            partition: Partition,
+            addresses: &[Address],
+            match_requested: StoreMatch,
+        ) -> Result<Vec<StoreMatch>, StoreError> {
+            self.inner
+                .clone()
+                .exist_batch(partition, addresses, match_requested)
+                .await
+        }
+
+        async fn query(
+            self: Arc<Self>,
+            partition: Partition,
+            address: Address,
+            match_requested: StoreMatch,
+        ) -> Result<StoreQueryResult, StoreError> {
+            self.inner
+                .clone()
+                .query(partition, address, match_requested)
+                .await
+        }
+
+        async fn get(
+            self: Arc<Self>,
+            partition: Partition,
+            address: Address,
+            match_required: StoreMatch,
+        ) -> Result<(Fragment, Bytes), StoreError> {
+            self.get_count.fetch_add(1, Ordering::Relaxed);
+            self.inner
+                .clone()
+                .get(partition, address, match_required)
+                .await
+        }
+
+        async fn put(
+            self: Arc<Self>,
+            partition: Partition,
+            address: Address,
+            fragment: Fragment,
+            payload: Option<Bytes>,
+            force: bool,
+        ) -> Result<(), StoreError> {
+            self.inner
+                .clone()
+                .put(partition, address, fragment, payload, force)
+                .await
+        }
+
+        async fn obliterate(
+            self: Arc<Self>,
+            partition: Partition,
+            address: Address,
+            stats: Arc<StoreObliterateStats>,
+        ) -> Result<(), StoreError> {
+            self.inner
+                .clone()
+                .obliterate(partition, address, stats)
+                .await
+        }
+
+        async fn evict(
+            self: Arc<Self>,
+            max_capacity: usize,
+            sync_data: bool,
+        ) -> Result<usize, StoreError> {
+            self.inner.clone().evict(max_capacity, sync_data).await
+        }
+
+        async fn compact(
+            self: Arc<Self>,
+            max_size: usize,
+            at: Option<usize>,
+            sync_data: bool,
+        ) -> Result<Option<usize>, StoreError> {
+            self.inner.clone().compact(max_size, at, sync_data).await
+        }
+
+        async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {
+            self.inner.clone().compact_resume_at().await
+        }
+
+        async fn compact_stop(self: Arc<Self>) {
+            self.inner.clone().compact_stop().await;
+        }
+
+        fn max_query_batch(&self) -> Option<usize> {
+            self.inner.max_query_batch()
+        }
+
+        async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
+            self.inner.clone().flush(sync_data).await
+        }
+
+        async fn fragment_count(self: Arc<Self>) -> Option<usize> {
+            self.inner.clone().fragment_count().await
+        }
+
+        async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError> {
+            self.inner.clone().verify(heal).await
+        }
+
+        async fn copy(
+            self: Arc<Self>,
+            source_partition: Partition,
+            source_address: Address,
+            destination_partition: Partition,
+            destination_context: Context,
+            durable: bool,
+        ) -> Result<(), StoreError> {
+            self.inner
+                .clone()
+                .copy(
+                    source_partition,
+                    source_address,
+                    destination_partition,
+                    destination_context,
+                    durable,
+                )
+                .await
+        }
+    }
+
+    async fn serve_public_payload_once(
+        body: Bytes,
+        get_count: Arc<AtomicUsize>,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind public payload test server");
+        let addr = listener.local_addr().expect("public payload test address");
+        let handle = lore_base::lore_spawn!(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept public GET");
+            let mut request = Vec::new();
+            loop {
+                let mut buf = [0u8; 512];
+                let read = socket.read(&mut buf).await.expect("read public GET");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            get_count.fetch_add(1, Ordering::Relaxed);
+            let request = String::from_utf8(request).expect("HTTP request utf8");
+            let path = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or("")
+                .to_owned();
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket
+                .write_all(header.as_bytes())
+                .await
+                .expect("write public response header");
+            socket
+                .write_all(&body)
+                .await
+                .expect("write public response body");
+            path
+        });
+
+        (format!("http://{addr}/"), handle)
+    }
 
     struct TestHandlerFactory {
         service_store: ServiceStore,
@@ -824,6 +1057,104 @@ mod tests {
         let cert = path.join("test_client_cert.pem");
         let key = path.join("test_client_key.pem");
         Ok((cert, key))
+    }
+
+    #[tokio::test]
+    async fn quic_public_read_fetches_payload_from_http_instead_of_server_get() {
+        let repository = random::<Partition>();
+
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create store");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let (fragment, address, payload) = generate_random();
+                immutable_store
+                    .clone()
+                    .put(repository, address, fragment, Some(payload.clone()), false)
+                    .await
+                    .expect("seed server immutable store");
+
+                let public_get_count = Arc::new(AtomicUsize::new(0));
+                let (public_base_url, public_request_path) =
+                    serve_public_payload_once(payload.clone(), public_get_count.clone()).await;
+
+                let server_get_count = Arc::new(AtomicUsize::new(0));
+                let public_store = Arc::new(PublicReadCountingStore::new(
+                    immutable_store.clone(),
+                    public_base_url,
+                    server_get_count.clone(),
+                ));
+
+                let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+                let server_addr = socket.local_addr().expect("Failed socket setup");
+                drop(socket);
+
+                let (cert_path, key_path, _) = server_certs().expect("Bad cert paths");
+
+                let _server = QuinnServer::start(
+                    QuinnConfigBuilder::new()
+                        .address(server_addr)
+                        .cert_file(cert_path)
+                        .pkey_file(key_path)
+                        .stream_handler_factory(Box::new(TestHandlerFactory::new(
+                            public_store,
+                            mutable_store.clone(),
+                        )))
+                        .build()
+                        .unwrap(),
+                )
+                .expect("Failed Quinn server start");
+
+                let remote_url = format!("quic://{server_addr}");
+                let client = StorageClient::connect(
+                    std::sync::Weak::new(),
+                    &remote_url,
+                    "127.0.0.1".to_string(),
+                    "",
+                    "",
+                    repository,
+                )
+                .await
+                .expect("connect storage client");
+
+                let start = client
+                    .session_start(repository, "public-read-e2e")
+                    .await
+                    .expect("start storage session");
+                let public_config = match start.immutable_payload_read {
+                    ImmutablePayloadReadMode::PublicHttp(config) => config,
+                    other @ ImmutablePayloadReadMode::ServerStream => {
+                        panic!("expected public HTTP read capability, got {other:?}")
+                    }
+                };
+
+                let loaded_fragment = client
+                    .get_metadata(start.session_id, &address)
+                    .await
+                    .expect("metadata comes from loreserver");
+                let loaded_payload =
+                    lore_storage::read::PublicHttpImmutablePayloadSource::new(public_config)
+                        .expect("public HTTP payload source")
+                        .get_payload(address.hash, loaded_fragment)
+                        .await
+                        .expect("payload comes from public HTTP");
+
+                assert_eq!(loaded_fragment.size_payload, fragment.size_payload);
+                assert_eq!(loaded_payload, payload);
+                assert_eq!(
+                    public_request_path.await.expect("public request path"),
+                    format!("/{}", address.hash)
+                );
+                assert_eq!(public_get_count.load(Ordering::Relaxed), 1);
+                assert_eq!(
+                    server_get_count.load(Ordering::Relaxed),
+                    0,
+                    "public-read remote get must not ask loreserver for payload bytes"
+                );
+            }))
+            .await
+            .expect("Test task failed");
     }
 
     #[tokio::test]
@@ -1664,9 +1995,16 @@ mod tests {
                 .await;
 
                 assert!(!resp.error, "Authorize start failed: {resp:?}");
-                assert_eq!(resp.size_or_status, 4);
-                let session_id_bytes = read_payload(&mut recv, 4).await;
-                let session_id = u32::from_le_bytes(session_id_bytes.try_into().unwrap());
+                let session_start_payload =
+                    read_payload(&mut recv, resp.size_or_status as usize).await;
+                let session_start =
+                    lore_transport::StorageSessionStart::decode_quic_v4(&session_start_payload)
+                        .expect("decode session-start payload");
+                assert_eq!(
+                    session_start.immutable_payload_read,
+                    lore_transport::ImmutablePayloadReadMode::ServerStream
+                );
+                let session_id = session_start.session_id;
                 assert!(session_id >= 1);
 
                 // === Put a fragment via the protocol ===
@@ -1793,9 +2131,16 @@ mod tests {
                 .await;
 
                 assert!(!resp.error, "Authorize start session 2 failed: {resp:?}");
-                assert_eq!(resp.size_or_status, 4);
-                let session_id_2_bytes = read_payload(&mut recv, 4).await;
-                let session_id_2 = u32::from_le_bytes(session_id_2_bytes.try_into().unwrap());
+                let session_start_2_payload =
+                    read_payload(&mut recv, resp.size_or_status as usize).await;
+                let session_start_2 =
+                    lore_transport::StorageSessionStart::decode_quic_v4(&session_start_2_payload)
+                        .expect("decode second session-start payload");
+                assert_eq!(
+                    session_start_2.immutable_payload_read,
+                    lore_transport::ImmutablePayloadReadMode::ServerStream
+                );
+                let session_id_2 = session_start_2.session_id;
                 assert!(session_id_2 >= 1);
                 assert_ne!(session_id_2, session_id, "Sessions must have different IDs");
 

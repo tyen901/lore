@@ -30,6 +30,7 @@ lore-base = { workspace = true }
 lore-storage = { workspace = true }
 lore-aws = { workspace = true }
 lore-revision = { workspace = true }
+lore-transport = { workspace = true }
 lore-hashicorp = { workspace = true }
 lore-proto = { workspace = true }
 lore-server = { workspace = true, features = ["integration_tests"] }

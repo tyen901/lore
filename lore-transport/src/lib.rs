@@ -4,6 +4,7 @@ pub mod auth;
 pub mod connection;
 pub mod error;
 pub mod grpc;
+pub mod public_read;
 pub mod quic;
 pub mod session;
 pub mod tls;
@@ -13,6 +14,7 @@ pub mod util;
 
 pub use connection::*;
 pub use error::*;
+pub use public_read::*;
 pub use session::*;
 pub use traits::*;
 pub use types::*;

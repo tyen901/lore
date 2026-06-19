@@ -17,6 +17,9 @@ use tokio::task::JoinSet;
 
 use crate::connection::Connection;
 use crate::error::ProtocolError;
+use crate::public_read::ImmutablePayloadReadMode;
+use crate::public_read::PublicObjectReadConfig;
+use crate::public_read::StorageSessionStart;
 use crate::traits::Storage;
 
 /// A live session on a `Storage` connection. Provides all storage operations
@@ -39,6 +42,7 @@ struct ResolvedFields {
     #[allow(dead_code)]
     connection: Arc<Connection>,
     session_id: u32,
+    immutable_payload_read: ImmutablePayloadReadMode,
 }
 
 /// Closure signature for a pending session's resolver. The resolver runs at most
@@ -69,13 +73,14 @@ impl StorageSession {
     pub(crate) fn resolved(
         storage: Arc<dyn Storage>,
         connection: Arc<Connection>,
-        session_id: u32,
+        start: StorageSessionStart,
     ) -> Self {
         Self {
             inner: SessionInner::Resolved(ResolvedFields {
                 storage,
                 connection,
-                session_id,
+                session_id: start.session_id,
+                immutable_payload_read: start.immutable_payload_read,
             }),
         }
     }
@@ -131,11 +136,17 @@ impl StorageSession {
         }
     }
 
-    /// Get the resolved `(storage, session_id)` pair, driving the pending
+    /// Get the resolved `(storage, session_id, immutable_payload_read)` tuple, driving the pending
     /// resolver on first call. All operation methods go through here.
-    async fn ensure(&self) -> Result<(Arc<dyn Storage>, u32), ProtocolError> {
+    async fn ensure(
+        &self,
+    ) -> Result<(Arc<dyn Storage>, u32, ImmutablePayloadReadMode), ProtocolError> {
         match &self.inner {
-            SessionInner::Resolved(r) => Ok((r.storage.clone(), r.session_id)),
+            SessionInner::Resolved(r) => Ok((
+                r.storage.clone(),
+                r.session_id,
+                r.immutable_payload_read.clone(),
+            )),
             SessionInner::Pending { resolver, resolved } => {
                 // Single-writer initialization: the lock both serialises
                 // resolver calls and gates the slot against concurrent
@@ -153,7 +164,11 @@ impl StorageSession {
                 // The resolver always produces an eager session, so reach
                 // directly into its fields without recursing.
                 match &inner.inner {
-                    SessionInner::Resolved(r) => Ok((r.storage.clone(), r.session_id)),
+                    SessionInner::Resolved(r) => Ok((
+                        r.storage.clone(),
+                        r.session_id,
+                        r.immutable_payload_read.clone(),
+                    )),
                     SessionInner::Pending { .. } => {
                         Err(ProtocolError::internal("nested pending session"))
                     }
@@ -163,7 +178,7 @@ impl StorageSession {
     }
 
     pub async fn get(&self, address: &Address) -> Result<(Fragment, Bytes), ProtocolError> {
-        let (storage, session_id) = self.ensure().await?;
+        let (storage, session_id, _) = self.ensure().await?;
         storage.get(session_id, address).await
     }
 
@@ -171,7 +186,7 @@ impl StorageSession {
         &self,
         address: &Address,
     ) -> Result<(Fragment, Bytes), ProtocolError> {
-        let (storage, session_id) = self.ensure().await?;
+        let (storage, session_id, _) = self.ensure().await?;
         storage.get_priority(session_id, address).await
     }
 
@@ -181,12 +196,12 @@ impl StorageSession {
         fragment: Fragment,
         payload: Option<Bytes>,
     ) -> Result<(), ProtocolError> {
-        let (storage, session_id) = self.ensure().await?;
+        let (storage, session_id, _) = self.ensure().await?;
         storage.put(session_id, address, fragment, payload).await
     }
 
     pub async fn query(&self, address: &[Address]) -> Result<Bytes, ProtocolError> {
-        let (storage, session_id) = self.ensure().await?;
+        let (storage, session_id, _) = self.ensure().await?;
         storage.query(session_id, address).await
     }
 
@@ -195,7 +210,7 @@ impl StorageSession {
         address: &Address,
         heal: bool,
     ) -> Result<VerifyResult, ProtocolError> {
-        let (storage, session_id) = self.ensure().await?;
+        let (storage, session_id, _) = self.ensure().await?;
         storage.verify(session_id, address, heal).await
     }
 
@@ -205,7 +220,7 @@ impl StorageSession {
         source_address: Address,
         target_context: Context,
     ) -> Result<(), ProtocolError> {
-        let (storage, session_id) = self.ensure().await?;
+        let (storage, session_id, _) = self.ensure().await?;
         storage
             .copy(
                 session_id,
@@ -221,12 +236,22 @@ impl StorageSession {
     /// Use this when the caller needs metadata without paying the payload transfer cost — e.g.
     /// the storage API's `query` op for remote-hit metadata lookups.
     pub async fn get_metadata(&self, address: &Address) -> Result<Fragment, ProtocolError> {
-        let (storage, session_id) = self.ensure().await?;
+        let (storage, session_id, _) = self.ensure().await?;
         storage.get_metadata(session_id, address).await
     }
 
+    pub async fn public_object_read_config(
+        &self,
+    ) -> Result<Option<PublicObjectReadConfig>, ProtocolError> {
+        let (_, _, mode) = self.ensure().await?;
+        Ok(match mode {
+            ImmutablePayloadReadMode::ServerStream => None,
+            ImmutablePayloadReadMode::PublicHttp(config) => Some(config),
+        })
+    }
+
     pub async fn mutable_load(&self, key: &Hash, key_type: KeyType) -> Result<Hash, ProtocolError> {
-        let (storage, session_id) = self.ensure().await?;
+        let (storage, session_id, _) = self.ensure().await?;
         storage.mutable_load(session_id, key, key_type).await
     }
 
@@ -236,7 +261,7 @@ impl StorageSession {
         value: Hash,
         key_type: KeyType,
     ) -> Result<(), ProtocolError> {
-        let (storage, session_id) = self.ensure().await?;
+        let (storage, session_id, _) = self.ensure().await?;
         storage
             .mutable_store(session_id, key, value, key_type)
             .await
@@ -249,7 +274,7 @@ impl StorageSession {
         value: Hash,
         key_type: KeyType,
     ) -> Result<Hash, ProtocolError> {
-        let (storage, session_id) = self.ensure().await?;
+        let (storage, session_id, _) = self.ensure().await?;
         storage
             .mutable_compare_and_swap(session_id, key, expected, value, key_type)
             .await
@@ -393,8 +418,8 @@ impl StorageConnector {
             let correlation_id = correlation_id.to_string();
             let started = started.clone();
             lore_spawn!(tasks, async move {
-                let session_id = storage.session_start(repository, &correlation_id).await?;
-                started.lock().push((storage, session_id));
+                let start = storage.session_start(repository, &correlation_id).await?;
+                started.lock().push((storage, start));
                 Ok::<_, ProtocolError>(())
             });
         }
@@ -405,7 +430,7 @@ impl StorageConnector {
         let Ok(started) = Arc::try_unwrap(started) else {
             unreachable!("session_start tasks dropped their Arc<Mutex<_>> clones");
         };
-        let started: Vec<(Arc<dyn Storage>, u32)> = started.into_inner();
+        let started: Vec<(Arc<dyn Storage>, StorageSessionStart)> = started.into_inner();
 
         // session_start succeeded on every connection in parallel above; the partition is now
         // in `authorized_repos` of every server-side `SessionMap` for the pool. Even on the
@@ -418,11 +443,11 @@ impl StorageConnector {
         // Build the pool with strong refs to every session.
         let sessions: Vec<Arc<StorageSession>> = started
             .iter()
-            .map(|(storage, session_id)| {
+            .map(|(storage, start)| {
                 Arc::new(StorageSession::resolved(
                     storage.clone(),
                     connection.clone(),
-                    *session_id,
+                    start.clone(),
                 ))
             })
             .collect();
@@ -430,7 +455,7 @@ impl StorageConnector {
             sessions,
             next: AtomicUsize::new(0),
         });
-        let session_ids: Vec<u32> = started.iter().map(|(_, id)| *id).collect();
+        let session_ids: Vec<u32> = started.iter().map(|(_, start)| start.session_id).collect();
         let storages: Vec<Weak<dyn Storage>> =
             started.iter().map(|(s, _)| Arc::downgrade(s)).collect();
 

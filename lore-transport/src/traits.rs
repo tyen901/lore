@@ -9,6 +9,7 @@ use lore_base::types::*;
 
 use crate::connection::Connection;
 use crate::error::ProtocolError;
+use crate::public_read::StorageSessionStart;
 use crate::types::*;
 
 /// Protocol interface
@@ -83,7 +84,7 @@ pub trait Storage: Send + Sync {
         &self,
         repository: RepositoryId,
         correlation_id: &str,
-    ) -> Result<u32, ProtocolError>;
+    ) -> Result<StorageSessionStart, ProtocolError>;
 
     /// Stop an active session, releasing server-side capacity.
     async fn session_stop(&self, session_id: u32) -> Result<(), ProtocolError>;

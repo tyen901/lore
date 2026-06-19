@@ -49,6 +49,7 @@ use super::super::storage_service::MAX_CHUNK_SIZE;
 use super::super::storage_service::auth::StorageClientAuth;
 use crate::connection::Connection;
 use crate::error::ProtocolError;
+use crate::public_read::StorageSessionStart;
 use crate::quic::client::CongestionAlgorithm;
 use crate::traits::Storage;
 
@@ -270,7 +271,7 @@ impl Storage for StorageClient {
         &self,
         repository: RepositoryId,
         correlation_id: &str,
-    ) -> Result<u32, ProtocolError> {
+    ) -> Result<StorageSessionStart, ProtocolError> {
         // Fetch auth token via token exchange (cached if already exchanged)
         let token = if !self.auth_url.is_empty() {
             let (_, authorization_token, _) = crate::auth::exchange::auth_exchange(
@@ -304,15 +305,7 @@ impl Storage for StorageClient {
         })
         .await?;
 
-        if response.len() != 4 {
-            return Err(ProtocolError::internal(format!(
-                "session_start: expected 4-byte response, got {} bytes",
-                response.len()
-            )));
-        }
-
-        let session_id = u32::from_le_bytes(response[..4].try_into().unwrap());
-        Ok(session_id)
+        StorageSessionStart::decode_quic_v4(&response)
     }
 
     async fn session_stop(&self, session_id: u32) -> Result<(), ProtocolError> {

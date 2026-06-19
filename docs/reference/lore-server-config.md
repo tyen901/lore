@@ -323,6 +323,28 @@ This repository ships two reference plugin implementations as source. Both requi
 > [!NOTE]
 > Per-field configuration for these plugins depends on the binary that registers them and is out of scope for this page. A dedicated Server plugins guide — covering the plugin registry, the factory traits, and how to build a server binary with plugins compiled in — is planned.
 
+### AWS immutable-store public payload reads
+
+The `lore-aws` immutable store can advertise a public HTTP read path for immutable payload objects:
+
+```toml
+[plugins.aws.immutable_store]
+s3_bucket = "lore-public-payloads"
+s3_endpoint_url = "https://<ACCOUNT_ID>.r2.cloudflarestorage.com"
+s3_region = "auto"
+s3_force_path_style = true
+
+public_read_enabled = true
+public_read_base_url = "https://objects.example.com"
+
+dynamodb_fragments_table = "lore-fragments"
+dynamodb_metadata_table = "lore-fragment-metadata"
+```
+
+When this is enabled, clients still contact `loreserver` for repository, revision, authorization, and fragment metadata, but missing immutable payload bytes are fetched directly from `{public_read_base_url}/{hash_hex}` and verified before use. `public_read_base_url` is required when `public_read_enabled` is `true`; trailing slashes are normalized away. Leave `public_read_enabled` unset or `false` to keep the existing server-stream payload path.
+
+For Cloudflare R2 production deployments, configure `s3_endpoint_url` with the R2 S3 API endpoint, use `s3_region = "auto"`, and set `public_read_base_url` to the bucket's public custom domain. Do not use the R2 public URL as a write endpoint; writes still go through the S3-compatible API from `loreserver`.
+
 ## Hook system config
 
 Hooks run custom logic at points in the server lifecycle. Each hook is configured in its own `[hooks.<name>]` table. Every hook table has an `enabled` flag (default `false`) plus fields specific to that hook.

@@ -38,6 +38,9 @@ mod aws_store_tests {
     use lore_storage::StoreMatch;
     use lore_storage::StoreObliterateStats;
     use lore_storage::StoreQueryResult;
+    use lore_storage::read::PublicHttpImmutablePayloadSource;
+    use lore_transport::PublicObjectKeyScheme;
+    use lore_transport::PublicObjectReadConfig as TransportPublicObjectReadConfig;
     use rand::random;
 
     use crate::common::aws_common::FRAGMENT_METADATA_TABLE_NAME;
@@ -54,6 +57,30 @@ mod aws_store_tests {
     fn typed_key(mut key: Hash, key_type: KeyType) -> Hash {
         key.data_mut()[0] = key_type as u8;
         key
+    }
+
+    async fn allow_public_bucket_reads(
+        s3: &lore_aws::s3::S3,
+    ) -> Result<(), Box<dyn Error + 'static>> {
+        let policy = serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": ["s3:GetObject"],
+                "Resource": format!("arn:aws:s3:::{STORE_BUCKET_NAME}/*")
+            }]
+        })
+        .to_string();
+
+        s3.sdk_client()
+            .put_bucket_policy()
+            .bucket(STORE_BUCKET_NAME)
+            .policy(policy)
+            .send()
+            .await?;
+
+        Ok(())
     }
 
     #[derive(Default)]
@@ -1230,6 +1257,80 @@ mod aws_store_tests {
                 expected.sort_by_key(|(k, _)| *k);
                 results.sort_by_key(|(k, _)| *k);
                 assert_eq!(results, expected);
+
+                Ok(())
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn public_http_reads_payload_written_by_aws_immutable_store() -> TestResult {
+        let repository = random::<RepositoryId>();
+        let (fragment, address, payload) = fragment::generate_random();
+
+        let execution = setup_execution("test".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let (s3, dynamo_immutable, _) =
+                    setup(vec![FRAGMENTS_TABLE_NAME, FRAGMENT_METADATA_TABLE_NAME]).await?;
+                allow_public_bucket_reads(&s3).await?;
+                let s3_client = s3.sdk_client().clone();
+
+                let public_base_url = format!("http://127.0.0.1:9000/{STORE_BUCKET_NAME}");
+                let store_settings = AwsImmutableStoreSettings::new(
+                    S3StoreSettings::new(STORE_BUCKET_NAME.to_string()),
+                    DynamoDbImmutableStoreSettings::new(
+                        FRAGMENTS_TABLE_NAME.to_string(),
+                        FRAGMENT_METADATA_TABLE_NAME.to_string(),
+                    ),
+                    false,
+                )
+                .with_public_read(Some(lore_storage::PublicObjectReadConfig::new(
+                    public_base_url.clone(),
+                )));
+
+                let aws_immutable_store = Arc::new(AwsImmutableStore::new(
+                    s3,
+                    dynamo_immutable,
+                    &store_settings,
+                ));
+                assert_eq!(
+                    aws_immutable_store
+                        .public_object_read_config()
+                        .expect("public read config")
+                        .base_url,
+                    public_base_url
+                );
+
+                aws_immutable_store
+                    .clone()
+                    .put(repository, address, fragment, Some(payload.clone()), false)
+                    .await?;
+
+                let source =
+                    PublicHttpImmutablePayloadSource::new(TransportPublicObjectReadConfig {
+                        base_url: public_base_url,
+                        key_scheme: PublicObjectKeyScheme::HashHex,
+                    })?;
+                let loaded = source.get_payload(address.hash, fragment).await?;
+                assert_eq!(loaded, payload);
+
+                let key = address.hash.to_string();
+                s3_client
+                    .put_object()
+                    .bucket(STORE_BUCKET_NAME)
+                    .key(key)
+                    .body(aws_sdk_s3::primitives::ByteStream::from_static(
+                        b"corrupt-public-payload",
+                    ))
+                    .send()
+                    .await?;
+
+                let corrupt_result = source.get_payload(address.hash, fragment).await;
+                assert!(
+                    corrupt_result.is_err(),
+                    "corrupt public object payload must be rejected"
+                );
 
                 Ok(())
             })

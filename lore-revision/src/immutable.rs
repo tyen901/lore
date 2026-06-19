@@ -495,7 +495,7 @@ pub async fn cache(
         let mut additional_address = Vec::with_capacity(query_count);
 
         let mut process_fetch =
-            |result: Result<Result<(Address, Fragment, Bytes), ProtocolError>, _>,
+            |result: Result<Result<(Address, Fragment, Bytes), StoreError>, _>,
              store_tasks: &mut JoinSet<Result<(), StoreError>>| {
                 // Cache is best effort, ignore errors
                 let Ok(result) = result else {
@@ -542,10 +542,19 @@ pub async fn cache(
                     let remote_storage = remote_storage.clone();
                     let address = address[index];
                     lore_spawn!(fetch_tasks, async move {
-                        remote_storage
-                            .get(&address)
-                            .await
-                            .map(|(fragment, buffer)| (address, fragment, buffer))
+                        lore_storage::read::load_remote_raw_payload(
+                            remote_storage.as_ref(),
+                            address,
+                            false,
+                        )
+                        .await
+                        .map_err(|err| {
+                            StoreError::internal_with_context(
+                                err,
+                                "Remote fragment prefetch failed",
+                            )
+                        })
+                        .map(|(fragment, buffer)| (address, fragment, buffer))
                     });
 
                     {

@@ -15,6 +15,7 @@ use crate::Fragment;
 use crate::FragmentFlags;
 use crate::FragmentReference;
 use crate::Partition;
+use crate::PublicObjectReadConfig;
 use crate::TypedBytes;
 use crate::errors::AddressNotFound;
 use crate::errors::Disconnected;
@@ -283,6 +284,12 @@ pub trait ImmutableStore: Any + Send + Sync {
     /// Check if this store is backed by local disk
     fn is_local(&self) -> bool {
         false
+    }
+
+    /// Public direct-read configuration for immutable payload objects, when this store exposes
+    /// payloads through deterministic content-addressed HTTP URLs.
+    fn public_object_read_config(&self) -> Option<PublicObjectReadConfig> {
+        None
     }
 
     /// Check if this store is available for service

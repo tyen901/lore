@@ -4,13 +4,18 @@ use std::cmp::min;
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use bytes::BytesMut;
 use lore_error_set::prelude::*;
+use lore_transport::PublicObjectKeyScheme;
+use lore_transport::PublicObjectReadConfig as TransportPublicObjectReadConfig;
 use lore_transport::StorageSession;
+use reqwest::StatusCode;
+use tokio::sync::Semaphore;
 
 use crate::STORE_RETRY_ATTEMPTS;
 use crate::compress;
@@ -131,6 +136,174 @@ pub fn remote_fetch_inflight() -> u64 {
     REMOTE_FETCH_INFLIGHT.load(Ordering::Relaxed)
 }
 
+static PUBLIC_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+static PUBLIC_HTTP_GET_LIMITER: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+pub struct PublicHttpImmutablePayloadSource {
+    base_url: String,
+    http_client: reqwest::Client,
+    limiter: Arc<Semaphore>,
+}
+
+impl PublicHttpImmutablePayloadSource {
+    pub fn new(config: TransportPublicObjectReadConfig) -> Result<Self, StorageError> {
+        match config.key_scheme {
+            PublicObjectKeyScheme::HashHex => {}
+        }
+        Ok(Self {
+            base_url: config.base_url.trim_end_matches('/').to_owned(),
+            http_client: PUBLIC_HTTP_CLIENT.get_or_init(reqwest::Client::new).clone(),
+            limiter: PUBLIC_HTTP_GET_LIMITER
+                .get_or_init(|| Arc::new(Semaphore::new(32)))
+                .clone(),
+        })
+    }
+
+    pub fn url_for_hash(&self, hash: crate::Hash) -> String {
+        format!("{}/{}", self.base_url, hash)
+    }
+
+    pub async fn get_payload(
+        &self,
+        hash: crate::Hash,
+        fragment: Fragment,
+    ) -> Result<Bytes, StorageError> {
+        let _permit =
+            self.limiter.acquire().await.map_err(|err| {
+                StorageError::internal_with_context(err, "public HTTP GET permit")
+            })?;
+        let url = self.url_for_hash(hash);
+        let mut retry = store_retry();
+        loop {
+            let response = self.http_client.get(&url).send().await;
+            match response {
+                Ok(response) if response.status() == StatusCode::OK => {
+                    return self.read_verified_body(response, hash, fragment).await;
+                }
+                Ok(response) if response.status() == StatusCode::NOT_FOUND => {
+                    return Err(StorageError::from(crate::errors::AddressNotFound::from(
+                        Address::zero_context_hash(hash),
+                    )));
+                }
+                Ok(response)
+                    if response.status() == StatusCode::TOO_MANY_REQUESTS
+                        || response.status().is_server_error() =>
+                {
+                    if !retry.wait().await {
+                        return Err(StorageError::from(SlowDown));
+                    }
+                }
+                Ok(response) => {
+                    return Err(StorageError::internal(format!(
+                        "public immutable payload GET {url} failed with HTTP {}",
+                        response.status()
+                    )));
+                }
+                Err(err) => {
+                    if !retry.wait().await {
+                        return Err(StorageError::internal_with_context(
+                            err,
+                            "public immutable payload GET failed",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    async fn read_verified_body(
+        &self,
+        mut response: reqwest::Response,
+        hash: crate::Hash,
+        fragment: Fragment,
+    ) -> Result<Bytes, StorageError> {
+        let expected = fragment.size_payload as usize;
+        if let Some(len) = response.content_length() {
+            if len != fragment.size_payload as u64 {
+                return Err(StorageError::internal(format!(
+                    "public immutable payload size mismatch for {hash}: expected {}, got {len}",
+                    fragment.size_payload
+                )));
+            }
+            if len as usize > crate::FRAGMENT_SIZE_THRESHOLD {
+                return Err(StorageError::from(crate::errors::Oversized {
+                    context: format!(
+                        "public immutable payload size {len} exceeds FRAGMENT_SIZE_THRESHOLD {}",
+                        crate::FRAGMENT_SIZE_THRESHOLD
+                    ),
+                }));
+            }
+        }
+
+        let mut bytes = BytesMut::with_capacity(expected);
+        while let Some(chunk) = response.chunk().await.map_err(|err| {
+            StorageError::internal_with_context(err, "public immutable payload body read failed")
+        })? {
+            if bytes.len() + chunk.len() > crate::FRAGMENT_SIZE_THRESHOLD {
+                return Err(StorageError::from(crate::errors::Oversized {
+                    context: format!(
+                        "public immutable payload body exceeds FRAGMENT_SIZE_THRESHOLD {}",
+                        crate::FRAGMENT_SIZE_THRESHOLD
+                    ),
+                }));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+
+        let bytes = bytes.freeze();
+        if bytes.len() != expected {
+            return Err(StorageError::internal(format!(
+                "public immutable payload size mismatch for {hash}: expected {expected}, got {}",
+                bytes.len()
+            )));
+        }
+        let loaded_hash = hash::hash_fragment(fragment, bytes.as_ref())
+            .map_err(|err| StorageError::internal_with_context(err, "public payload hash"))?;
+        if loaded_hash != hash {
+            return Err(StorageError::internal(format!(
+                "public immutable payload hash mismatch for {hash}: got {loaded_hash}"
+            )));
+        }
+        Ok(bytes)
+    }
+}
+
+fn should_store_remote_payload(
+    fragment: Fragment,
+    options: ReadOptions,
+    local_corrupt: bool,
+) -> bool {
+    options.cache
+        || local_corrupt
+        || (fragment.flags & FragmentFlags::PayloadLocalCachePriority) != 0
+}
+
+async fn cache_remote_payload(
+    store: Arc<dyn ImmutableStore>,
+    partition: Partition,
+    address: Address,
+    fragment: Fragment,
+    payload: Bytes,
+    options: ReadOptions,
+    local_corrupt: bool,
+) {
+    if should_store_remote_payload(fragment, options, local_corrupt) {
+        let local_payload = if options.cache
+            || local_corrupt
+            || (fragment.flags & FragmentFlags::PayloadLocalCachePriority)
+                == FragmentFlags::PayloadLocalCachePriority
+        {
+            Some(payload)
+        } else {
+            None
+        };
+        let force = local_corrupt;
+        let _ = store
+            .put(partition, address, fragment, local_payload, force)
+            .await;
+    }
+}
+
 /// RAII guard around [`REMOTE_FETCH_INFLIGHT`] so the counter can't leak on panic or early return.
 struct RemoteFetchGuard;
 impl RemoteFetchGuard {
@@ -155,7 +328,6 @@ async fn remote_get_retry(
     address: Address,
     priority: bool,
 ) -> Result<(Fragment, Bytes), StorageError> {
-    let _guard = RemoteFetchGuard::new();
     let mut retry = store_retry();
     let mut stale_session_retries: u32 = 0;
     loop {
@@ -200,6 +372,38 @@ async fn remote_get_retry(
 /// succeeds on the first or second retry once the session has been
 /// re-established.
 const MAX_STALE_SESSION_RETRIES: u32 = 5;
+
+/// Load a raw fragment payload from a remote session, using public object-store
+/// reads when the session advertises them and server streaming only otherwise.
+pub async fn load_remote_raw_payload(
+    session: &StorageSession,
+    address: Address,
+    priority: bool,
+) -> Result<(Fragment, Bytes), StorageError> {
+    let _guard = RemoteFetchGuard::new();
+    if let Some(public_config) = session
+        .public_object_read_config()
+        .await
+        .map_err(|err| crate::error::protocol_error_to_storage(err, address))?
+    {
+        lore_base::lore_trace!(
+            "Fetch immutable fragment {} from public object store",
+            address
+        );
+        let mut fragment = session
+            .get_metadata(&address)
+            .await
+            .map_err(|err| crate::error::protocol_error_to_storage(err, address))?;
+        fragment.flags |= FragmentFlags::PayloadStoredDurable;
+        let source = PublicHttpImmutablePayloadSource::new(public_config)?;
+        let payload = source.get_payload(address.hash, fragment).await?;
+        return Ok((fragment, payload));
+    }
+
+    let (mut fragment, payload) = remote_get_retry(session, address, priority).await?;
+    fragment.flags |= FragmentFlags::PayloadStoredDurable;
+    Ok((fragment, payload))
+}
 
 /// Unified fragment load: local -> decompress/verify -> optional remote fallback -> heal -> cache.
 ///
@@ -303,41 +507,49 @@ pub async fn load_fragment(
     let mut options = options;
     options.verify |= local_corrupt;
 
+    if session
+        .public_object_read_config()
+        .await
+        .map_err(|err| crate::error::protocol_error_to_storage(err, address))?
+        .is_some()
+    {
+        let (fragment, payload) =
+            load_remote_raw_payload(session.as_ref(), address, options.priority).await?;
+        let store_fragment = fragment;
+        let payload_for_cache = payload.clone();
+        let (fragment, buffer) = decompress_and_verify(fragment, payload, address, options).await?;
+        cache_remote_payload(
+            store,
+            partition,
+            address,
+            store_fragment,
+            payload_for_cache,
+            options,
+            local_corrupt,
+        )
+        .await;
+        return Ok((fragment, buffer));
+    }
+
     let mut heal_attempted = false;
     loop {
-        let (mut fragment, buffer) =
-            remote_get_retry(session.as_ref(), address, options.priority).await?;
-
-        fragment.flags |= FragmentFlags::PayloadStoredDurable;
+        let (fragment, buffer) =
+            load_remote_raw_payload(session.as_ref(), address, options.priority).await?;
         let store_fragment = fragment;
         let payload = buffer.clone();
 
         match decompress_and_verify(fragment, buffer, address, options).await {
             Ok((fragment, buffer)) => {
-                // Cache the fragment locally. Skip the put entirely when
-                // caching is disabled and data is not corrupt and has no
-                // local cache priority flag -- matching the original two-level
-                // gate in urc-core's load_raw.
-                let should_store = options.cache
-                    || local_corrupt
-                    || (fragment.flags & FragmentFlags::PayloadLocalCachePriority) != 0;
-
-                if should_store {
-                    let local_payload = if options.cache
-                        || local_corrupt
-                        || (fragment.flags & FragmentFlags::PayloadLocalCachePriority)
-                            == FragmentFlags::PayloadLocalCachePriority
-                    {
-                        Some(payload)
-                    } else {
-                        None
-                    };
-                    let force = local_corrupt;
-                    let _ = store
-                        .clone()
-                        .put(partition, address, store_fragment, local_payload, force)
-                        .await;
-                }
+                cache_remote_payload(
+                    store.clone(),
+                    partition,
+                    address,
+                    store_fragment,
+                    payload,
+                    options,
+                    local_corrupt,
+                )
+                .await;
 
                 return Ok((fragment, buffer));
             }
@@ -841,6 +1053,7 @@ mod tests {
     use crate::test_util::TempDir;
     use crate::types::Context;
     use crate::write::try_acquire_in_flight;
+    use lore_transport::PublicObjectReadConfig as TransportPublicObjectReadConfig;
 
     async fn make_test_store() -> (TempDir, Arc<dyn ImmutableStore>) {
         let dir = TempDir::new("lore-storage-read-test-");
@@ -867,6 +1080,128 @@ mod tests {
             size_content: payload.len() as u64,
         };
         (partition, address, fragment, Bytes::from(payload))
+    }
+
+    fn make_public_fragment(payload: &[u8]) -> (crate::Hash, Fragment, Bytes) {
+        let hash_value = hash::hash_slice(payload);
+        let fragment = Fragment {
+            flags: 0,
+            size_payload: payload.len() as u32,
+            size_content: payload.len() as u64,
+        };
+        (hash_value, fragment, Bytes::copy_from_slice(payload))
+    }
+
+    async fn serve_http_once(
+        status: &'static str,
+        body: Bytes,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind public object test server");
+        let addr = listener.local_addr().expect("public object test address");
+        let handle = lore_base::lore_spawn!(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept public object GET");
+            let mut request = Vec::new();
+            loop {
+                let mut buf = [0u8; 512];
+                let read = socket.read(&mut buf).await.expect("read HTTP request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8(request).expect("request is utf8");
+            let path = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or("")
+                .to_owned();
+            let header = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket
+                .write_all(header.as_bytes())
+                .await
+                .expect("write HTTP response header");
+            socket
+                .write_all(&body)
+                .await
+                .expect("write HTTP response body");
+            path
+        });
+
+        (format!("http://{addr}/"), handle)
+    }
+
+    fn public_source(base_url: String) -> PublicHttpImmutablePayloadSource {
+        PublicHttpImmutablePayloadSource::new(TransportPublicObjectReadConfig {
+            base_url,
+            key_scheme: PublicObjectKeyScheme::HashHex,
+        })
+        .expect("public source config")
+    }
+
+    #[tokio::test]
+    async fn public_http_fetches_hash_url_and_verifies_payload() {
+        let payload = Bytes::from_static(b"direct public immutable payload");
+        let (hash_value, fragment, expected) = make_public_fragment(&payload);
+        let (base_url, request_path) = serve_http_once("200 OK", payload).await;
+        let source = public_source(base_url);
+
+        let loaded = source
+            .get_payload(hash_value, fragment)
+            .await
+            .expect("public payload should verify");
+
+        assert_eq!(loaded, expected);
+        assert_eq!(
+            request_path.await.expect("request path"),
+            format!("/{hash_value}")
+        );
+    }
+
+    #[tokio::test]
+    async fn public_http_404_maps_to_address_not_found() {
+        let (hash_value, fragment, _) = make_public_fragment(b"missing public payload");
+        let (base_url, _request_path) = serve_http_once("404 Not Found", Bytes::new()).await;
+        let source = public_source(base_url);
+
+        let err = source
+            .get_payload(hash_value, fragment)
+            .await
+            .expect_err("404 must fail as not found");
+
+        assert!(
+            matches!(err, StorageError::AddressNotFound(_)),
+            "expected AddressNotFound, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_http_rejects_corrupt_payload() {
+        let (hash_value, fragment, _) = make_public_fragment(b"expected public payload");
+        let (base_url, _request_path) =
+            serve_http_once("200 OK", Bytes::from_static(b"corrupt public payload")).await;
+        let source = public_source(base_url);
+
+        let err = source
+            .get_payload(hash_value, fragment)
+            .await
+            .expect_err("corrupt public payload must fail verification");
+
+        assert!(
+            matches!(err, StorageError::Internal(_)),
+            "expected hash verification failure, got {err:?}"
+        );
     }
 
     /// Regression for the tracker-dispatched read-after-write race: a reader
