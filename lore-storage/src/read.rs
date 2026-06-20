@@ -284,22 +284,6 @@ pub async fn load_remote_raw_payload(
     Ok((fragment, payload))
 }
 
-fn public_payload_error_may_be_healed(err: &StorageError) -> bool {
-    matches!(
-        err,
-        StorageError::AddressNotFound(_)
-            | StorageError::PayloadNotFound(_)
-            | StorageError::Internal(_)
-    )
-}
-
-async fn try_remote_heal(session: &StorageSession, address: Address) -> bool {
-    session
-        .verify(&address, true)
-        .await
-        .is_ok_and(|result| result.healed == lore_base::types::HealResult::Healed)
-}
-
 /// Unified fragment load: local -> decompress/verify -> optional remote fallback -> heal -> cache.
 ///
 /// When `remote_session` is `Some`, the session is used for remote fetch if the
@@ -409,7 +393,6 @@ pub async fn load_fragment(
         .is_some();
 
     let mut heal_attempted = false;
-
     loop {
         let remote_result =
             load_remote_raw_payload(session.as_ref(), address, options.priority).await;
@@ -419,7 +402,12 @@ pub async fn load_fragment(
             Err(err)
                 if public_read_mode
                     && !heal_attempted
-                    && public_payload_error_may_be_healed(&err) =>
+                    && matches!(
+                        err,
+                        StorageError::AddressNotFound(_)
+                            | StorageError::PayloadNotFound(_)
+                            | StorageError::Internal(_)
+                    ) =>
             {
                 lore_base::lore_warn!(
                     "Public immutable payload {} could not be loaded: {}. Attempting server heal.",
@@ -427,7 +415,12 @@ pub async fn load_fragment(
                     err
                 );
 
-                if !try_remote_heal(session.as_ref(), address).await {
+                let healed = session
+                    .verify(&address, true)
+                    .await
+                    .is_ok_and(|result| result.healed == lore_base::types::HealResult::Healed);
+
+                if !healed {
                     lore_base::lore_error!(
                         "Server did not heal public immutable payload {}",
                         address.hash
@@ -446,6 +439,10 @@ pub async fn load_fragment(
 
         match decompress_and_verify(fragment, buffer, address, options).await {
             Ok((fragment, buffer)) => {
+                // Cache the fragment locally. Skip the put entirely when
+                // caching is disabled and data is not corrupt and has no
+                // local cache priority flag -- matching the original two-level
+                // gate in urc-core's load_raw.
                 let should_store = options.cache
                     || local_corrupt
                     || (fragment.flags & FragmentFlags::PayloadLocalCachePriority) != 0;
@@ -473,7 +470,6 @@ pub async fn load_fragment(
                 if matches!(err, StorageError::NotSupported(_)) {
                     return Err(err);
                 }
-
                 if heal_attempted {
                     lore_base::lore_error!(
                         "Fragment {} still corrupt after heal: {}",
@@ -483,17 +479,19 @@ pub async fn load_fragment(
                     return Err(err);
                 }
 
-                lore_base::lore_warn!(
-                    "Fragment {} failed verification: {}. Attempting heal.",
-                    address.hash,
-                    err
-                );
+                lore_base::lore_warn!("Fragment {}: {}. Attempting heal.", address.hash, err);
 
-                if !try_remote_heal(session.as_ref(), address).await {
+                let healed = session
+                    .verify(&address, true)
+                    .await
+                    .is_ok_and(|r| r.healed == lore_base::types::HealResult::Healed);
+
+                if !healed {
                     lore_base::lore_error!("Server did not heal fragment {}", address.hash);
                     return Err(err);
                 }
 
+                lore_base::lore_debug!("Server healed fragment {}, retrying fetch", address.hash);
                 heal_attempted = true;
             }
         }
