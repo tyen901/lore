@@ -134,15 +134,11 @@ impl StorageSession {
         }
     }
 
-    /// Get the resolved `(storage, session_id, public_read_base_url)` tuple, driving the pending
+    /// Get the resolved `(storage, session_id)` pair, driving the pending
     /// resolver on first call. All operation methods go through here.
-    async fn ensure(&self) -> Result<(Arc<dyn Storage>, u32, Option<String>), ProtocolError> {
+    async fn ensure(&self) -> Result<(Arc<dyn Storage>, u32), ProtocolError> {
         match &self.inner {
-            SessionInner::Resolved(r) => Ok((
-                r.storage.clone(),
-                r.session_id,
-                r.public_read_base_url.clone(),
-            )),
+            SessionInner::Resolved(r) => Ok((r.storage.clone(), r.session_id)),
             SessionInner::Pending { resolver, resolved } => {
                 // Single-writer initialization: the lock both serialises
                 // resolver calls and gates the slot against concurrent
@@ -160,11 +156,7 @@ impl StorageSession {
                 // The resolver always produces an eager session, so reach
                 // directly into its fields without recursing.
                 match &inner.inner {
-                    SessionInner::Resolved(r) => Ok((
-                        r.storage.clone(),
-                        r.session_id,
-                        r.public_read_base_url.clone(),
-                    )),
+                    SessionInner::Resolved(r) => Ok((r.storage.clone(), r.session_id)),
                     SessionInner::Pending { .. } => {
                         Err(ProtocolError::internal("nested pending session"))
                     }
@@ -174,7 +166,7 @@ impl StorageSession {
     }
 
     pub async fn get(&self, address: &Address) -> Result<(Fragment, Bytes), ProtocolError> {
-        let (storage, session_id, _) = self.ensure().await?;
+        let (storage, session_id) = self.ensure().await?;
         storage.get(session_id, address).await
     }
 
@@ -182,7 +174,7 @@ impl StorageSession {
         &self,
         address: &Address,
     ) -> Result<(Fragment, Bytes), ProtocolError> {
-        let (storage, session_id, _) = self.ensure().await?;
+        let (storage, session_id) = self.ensure().await?;
         storage.get_priority(session_id, address).await
     }
 
@@ -192,12 +184,12 @@ impl StorageSession {
         fragment: Fragment,
         payload: Option<Bytes>,
     ) -> Result<(), ProtocolError> {
-        let (storage, session_id, _) = self.ensure().await?;
+        let (storage, session_id) = self.ensure().await?;
         storage.put(session_id, address, fragment, payload).await
     }
 
     pub async fn query(&self, address: &[Address]) -> Result<Bytes, ProtocolError> {
-        let (storage, session_id, _) = self.ensure().await?;
+        let (storage, session_id) = self.ensure().await?;
         storage.query(session_id, address).await
     }
 
@@ -206,7 +198,7 @@ impl StorageSession {
         address: &Address,
         heal: bool,
     ) -> Result<VerifyResult, ProtocolError> {
-        let (storage, session_id, _) = self.ensure().await?;
+        let (storage, session_id) = self.ensure().await?;
         storage.verify(session_id, address, heal).await
     }
 
@@ -216,7 +208,7 @@ impl StorageSession {
         source_address: Address,
         target_context: Context,
     ) -> Result<(), ProtocolError> {
-        let (storage, session_id, _) = self.ensure().await?;
+        let (storage, session_id) = self.ensure().await?;
         storage
             .copy(
                 session_id,
@@ -232,17 +224,37 @@ impl StorageSession {
     /// Use this when the caller needs metadata without paying the payload transfer cost — e.g.
     /// the storage API's `query` op for remote-hit metadata lookups.
     pub async fn get_metadata(&self, address: &Address) -> Result<Fragment, ProtocolError> {
-        let (storage, session_id, _) = self.ensure().await?;
+        let (storage, session_id) = self.ensure().await?;
         storage.get_metadata(session_id, address).await
     }
 
     pub async fn public_object_read_base_url(&self) -> Result<Option<String>, ProtocolError> {
-        let (_, _, public_read_base_url) = self.ensure().await?;
-        Ok(public_read_base_url)
+        let _ = self.ensure().await?;
+
+        match &self.inner {
+            SessionInner::Resolved(r) => Ok(r.public_read_base_url.clone()),
+            SessionInner::Pending { resolved, .. } => {
+                let resolved = resolved.lock().await;
+                let inner = match resolved.as_ref() {
+                    Some(Ok(inner)) => inner,
+                    Some(Err(err)) => return Err(err.clone()),
+                    None => {
+                        return Err(ProtocolError::internal("pending session was not resolved"));
+                    }
+                };
+
+                match &inner.inner {
+                    SessionInner::Resolved(r) => Ok(r.public_read_base_url.clone()),
+                    SessionInner::Pending { .. } => {
+                        Err(ProtocolError::internal("nested pending session"))
+                    }
+                }
+            }
+        }
     }
 
     pub async fn mutable_load(&self, key: &Hash, key_type: KeyType) -> Result<Hash, ProtocolError> {
-        let (storage, session_id, _) = self.ensure().await?;
+        let (storage, session_id) = self.ensure().await?;
         storage.mutable_load(session_id, key, key_type).await
     }
 
@@ -252,7 +264,7 @@ impl StorageSession {
         value: Hash,
         key_type: KeyType,
     ) -> Result<(), ProtocolError> {
-        let (storage, session_id, _) = self.ensure().await?;
+        let (storage, session_id) = self.ensure().await?;
         storage
             .mutable_store(session_id, key, value, key_type)
             .await
@@ -265,7 +277,7 @@ impl StorageSession {
         value: Hash,
         key_type: KeyType,
     ) -> Result<Hash, ProtocolError> {
-        let (storage, session_id, _) = self.ensure().await?;
+        let (storage, session_id) = self.ensure().await?;
         storage
             .mutable_compare_and_swap(session_id, key, expected, value, key_type)
             .await

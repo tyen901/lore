@@ -651,8 +651,6 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    use async_trait::async_trait;
-    use bytes::Bytes;
     use lore_base::runtime::runtime;
     use lore_base::types::Context;
     use lore_revision::fragment::generate_random;
@@ -1666,13 +1664,9 @@ mod tests {
                 .await;
 
                 assert!(!resp.error, "Authorize start failed: {resp:?}");
-                let session_start_payload =
-                    read_payload(&mut recv, resp.size_or_status as usize).await;
-                let session_start =
-                    lore_transport::StorageSessionStart::decode_quic_v4(&session_start_payload)
-                        .expect("decode session-start payload");
-                assert!(session_start.public_read_base_url.is_none());
-                let session_id = session_start.session_id;
+                assert_eq!(resp.size_or_status, 4);
+                let session_id_bytes = read_payload(&mut recv, 4).await;
+                let session_id = u32::from_le_bytes(session_id_bytes.try_into().unwrap());
                 assert!(session_id >= 1);
 
                 // === Put a fragment via the protocol ===
@@ -1799,13 +1793,9 @@ mod tests {
                 .await;
 
                 assert!(!resp.error, "Authorize start session 2 failed: {resp:?}");
-                let session_start_2_payload =
-                    read_payload(&mut recv, resp.size_or_status as usize).await;
-                let session_start_2 =
-                    lore_transport::StorageSessionStart::decode_quic_v4(&session_start_2_payload)
-                        .expect("decode second session-start payload");
-                assert!(session_start_2.public_read_base_url.is_none());
-                let session_id_2 = session_start_2.session_id;
+                assert_eq!(resp.size_or_status, 4);
+                let session_id_2_bytes = read_payload(&mut recv, 4).await;
+                let session_id_2 = u32::from_le_bytes(session_id_2_bytes.try_into().unwrap());
                 assert!(session_id_2 >= 1);
                 assert_ne!(session_id_2, session_id, "Sessions must have different IDs");
 

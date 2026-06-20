@@ -18,6 +18,7 @@ use tokio::sync::Mutex;
 use super::StoreObliterateStats;
 use crate::error::LoreResultExt;
 use crate::errors::AddressNotFound;
+use crate::errors::Disconnected;
 use crate::lore::Address;
 use crate::lore::Context;
 use crate::lore::Fragment;
@@ -47,6 +48,7 @@ pub(crate) fn storage_error_to_store_error(err: lore_storage::StorageError) -> S
         lore_storage::StorageError::Maintenance(err) => StoreError::from(err.into_inner()),
         lore_storage::StorageError::NoRemote(err) => StoreError::from(err.into_inner()),
         lore_storage::StorageError::NotSupported(err) => StoreError::from(err.into_inner()),
+        lore_storage::StorageError::NotConnected(_) => StoreError::from(Disconnected),
         other => StoreError::internal_with_context(other, "remote storage error"),
     }
 }

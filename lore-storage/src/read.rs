@@ -4,17 +4,13 @@ use std::cmp::min;
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
 
 use bytes::Bytes;
 use bytes::BytesMut;
 use lore_error_set::prelude::*;
 use lore_transport::StorageSession;
-use reqwest::StatusCode;
-use tokio::sync::Semaphore;
 
 use crate::STORE_RETRY_ATTEMPTS;
 use crate::compress;
@@ -30,6 +26,7 @@ use crate::hash;
 use crate::immutable_store::ImmutableStore;
 use crate::immutable_store::StoreError;
 use crate::options::ReadOptions;
+use crate::public_read::fetch_public_hash_payload;
 use crate::store_types::StoreMatch;
 use crate::types::Address;
 use crate::types::Fragment;
@@ -135,209 +132,6 @@ pub fn remote_fetch_inflight() -> u64 {
     REMOTE_FETCH_INFLIGHT.load(Ordering::Relaxed)
 }
 
-static PUBLIC_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-static PUBLIC_HTTP_GET_LIMITER: OnceLock<Arc<Semaphore>> = OnceLock::new();
-
-fn public_http_client() -> reqwest::Client {
-    PUBLIC_HTTP_CLIENT
-        .get_or_init(|| {
-            reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(10))
-                .timeout(Duration::from_secs(120))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .expect("public HTTP client configuration is valid")
-        })
-        .clone()
-}
-
-fn public_http_limiter() -> Arc<Semaphore> {
-    PUBLIC_HTTP_GET_LIMITER
-        .get_or_init(|| Arc::new(Semaphore::new(32)))
-        .clone()
-}
-
-enum PublicHttpFetchError {
-    Retry(StorageError),
-    Fail(StorageError),
-}
-
-async fn fetch_public_hash_payload(
-    base_url: &str,
-    hash: crate::Hash,
-    fragment: Fragment,
-) -> Result<Bytes, StorageError> {
-    let config = crate::PublicObjectReadConfig::try_new(base_url)?;
-    let url = config.url_for_hash(hash);
-    let mut retry = store_retry();
-
-    loop {
-        match fetch_public_hash_payload_once(&url, hash, fragment).await {
-            Ok(payload) => return Ok(payload),
-            Err(PublicHttpFetchError::Retry(err)) => {
-                if !retry.wait().await {
-                    return Err(err);
-                }
-            }
-            Err(PublicHttpFetchError::Fail(err)) => return Err(err),
-        }
-    }
-}
-
-async fn fetch_public_hash_payload_once(
-    url: &str,
-    hash: crate::Hash,
-    fragment: Fragment,
-) -> Result<Bytes, PublicHttpFetchError> {
-    let limiter = public_http_limiter();
-    let _permit = limiter.acquire().await.map_err(|err| {
-        PublicHttpFetchError::Fail(StorageError::internal_with_context(
-            err,
-            "public HTTP GET permit",
-        ))
-    })?;
-
-    let response = public_http_client().get(url).send().await;
-
-    match response {
-        Ok(response) if response.status() == StatusCode::OK => {
-            read_verified_public_body(response, hash, fragment)
-                .await
-                .map_err(PublicHttpFetchError::Fail)
-        }
-
-        Ok(response) if response.status() == StatusCode::NOT_FOUND => {
-            Err(PublicHttpFetchError::Fail(StorageError::from(
-                crate::errors::AddressNotFound::from(Address::zero_context_hash(hash)),
-            )))
-        }
-
-        Ok(response)
-            if response.status() == StatusCode::TOO_MANY_REQUESTS
-                || response.status().is_server_error() =>
-        {
-            Err(PublicHttpFetchError::Retry(StorageError::from(SlowDown)))
-        }
-
-        Ok(response) => Err(PublicHttpFetchError::Fail(StorageError::internal(format!(
-            "public immutable payload GET {url} failed with HTTP {}",
-            response.status()
-        )))),
-
-        Err(err) => Err(PublicHttpFetchError::Retry(
-            StorageError::internal_with_context(err, "public immutable payload GET failed"),
-        )),
-    }
-}
-
-async fn read_verified_public_body(
-    mut response: reqwest::Response,
-    hash: crate::Hash,
-    fragment: Fragment,
-) -> Result<Bytes, StorageError> {
-    let expected = fragment.size_payload as usize;
-
-    if expected > crate::FRAGMENT_SIZE_THRESHOLD {
-        return Err(StorageError::from(crate::errors::Oversized {
-            context: format!(
-                "public immutable payload size {expected} exceeds FRAGMENT_SIZE_THRESHOLD {}",
-                crate::FRAGMENT_SIZE_THRESHOLD
-            ),
-        }));
-    }
-
-    if let Some(len) = response.content_length() {
-        if len != fragment.size_payload as u64 {
-            return Err(StorageError::internal(format!(
-                "public immutable payload size mismatch for {hash}: expected {}, got {len}",
-                fragment.size_payload
-            )));
-        }
-
-        if len as usize > crate::FRAGMENT_SIZE_THRESHOLD {
-            return Err(StorageError::from(crate::errors::Oversized {
-                context: format!(
-                    "public immutable payload size {len} exceeds FRAGMENT_SIZE_THRESHOLD {}",
-                    crate::FRAGMENT_SIZE_THRESHOLD
-                ),
-            }));
-        }
-    }
-
-    let mut bytes = BytesMut::with_capacity(expected);
-
-    while let Some(chunk) = response.chunk().await.map_err(|err| {
-        StorageError::internal_with_context(err, "public immutable payload body read failed")
-    })? {
-        if bytes.len() + chunk.len() > crate::FRAGMENT_SIZE_THRESHOLD {
-            return Err(StorageError::from(crate::errors::Oversized {
-                context: format!(
-                    "public immutable payload body exceeds FRAGMENT_SIZE_THRESHOLD {}",
-                    crate::FRAGMENT_SIZE_THRESHOLD
-                ),
-            }));
-        }
-
-        bytes.extend_from_slice(&chunk);
-    }
-
-    let bytes = bytes.freeze();
-
-    if bytes.len() != expected {
-        return Err(StorageError::internal(format!(
-            "public immutable payload size mismatch for {hash}: expected {expected}, got {}",
-            bytes.len()
-        )));
-    }
-
-    let loaded_hash = hash::hash_fragment(fragment, bytes.as_ref())
-        .map_err(|err| StorageError::internal_with_context(err, "public payload hash"))?;
-
-    if loaded_hash != hash {
-        return Err(StorageError::internal(format!(
-            "public immutable payload hash mismatch for {hash}: got {loaded_hash}"
-        )));
-    }
-
-    Ok(bytes)
-}
-
-fn should_store_remote_payload(
-    fragment: Fragment,
-    options: ReadOptions,
-    local_corrupt: bool,
-) -> bool {
-    options.cache
-        || local_corrupt
-        || (fragment.flags & FragmentFlags::PayloadLocalCachePriority) != 0
-}
-
-async fn cache_remote_payload(
-    store: Arc<dyn ImmutableStore>,
-    partition: Partition,
-    address: Address,
-    fragment: Fragment,
-    payload: Bytes,
-    options: ReadOptions,
-    local_corrupt: bool,
-) {
-    if should_store_remote_payload(fragment, options, local_corrupt) {
-        let local_payload = if options.cache
-            || local_corrupt
-            || (fragment.flags & FragmentFlags::PayloadLocalCachePriority)
-                == FragmentFlags::PayloadLocalCachePriority
-        {
-            Some(payload)
-        } else {
-            None
-        };
-        let force = local_corrupt;
-        let _ = store
-            .put(partition, address, fragment, local_payload, force)
-            .await;
-    }
-}
-
 /// RAII guard around [`REMOTE_FETCH_INFLIGHT`] so the counter can't leak on panic or early return.
 struct RemoteFetchGuard;
 impl RemoteFetchGuard {
@@ -362,6 +156,7 @@ async fn remote_get_retry(
     address: Address,
     priority: bool,
 ) -> Result<(Fragment, Bytes), StorageError> {
+    let _guard = RemoteFetchGuard::new();
     let mut retry = store_retry();
     let mut stale_session_retries: u32 = 0;
     loop {
@@ -403,6 +198,7 @@ async fn remote_get_metadata_retry(
     session: &StorageSession,
     address: Address,
 ) -> Result<Fragment, StorageError> {
+    let _guard = RemoteFetchGuard::new();
     let mut retry = store_retry();
     let mut stale_session_retries: u32 = 0;
 
@@ -453,8 +249,6 @@ pub async fn load_remote_metadata(
     session: &StorageSession,
     address: Address,
 ) -> Result<Fragment, StorageError> {
-    let _guard = RemoteFetchGuard::new();
-
     let mut fragment = remote_get_metadata_retry(session, address).await?;
     fragment.flags |= FragmentFlags::PayloadStoredDurable;
     Ok(fragment)
@@ -467,8 +261,6 @@ pub async fn load_remote_raw_payload(
     address: Address,
     priority: bool,
 ) -> Result<(Fragment, Bytes), StorageError> {
-    let _guard = RemoteFetchGuard::new();
-
     if let Some(public_read_base_url) = session
         .public_object_read_base_url()
         .await
@@ -654,16 +446,26 @@ pub async fn load_fragment(
 
         match decompress_and_verify(fragment, buffer, address, options).await {
             Ok((fragment, buffer)) => {
-                cache_remote_payload(
-                    store.clone(),
-                    partition,
-                    address,
-                    store_fragment,
-                    payload,
-                    options,
-                    local_corrupt,
-                )
-                .await;
+                let should_store = options.cache
+                    || local_corrupt
+                    || (fragment.flags & FragmentFlags::PayloadLocalCachePriority) != 0;
+
+                if should_store {
+                    let local_payload = if options.cache
+                        || local_corrupt
+                        || (fragment.flags & FragmentFlags::PayloadLocalCachePriority)
+                            == FragmentFlags::PayloadLocalCachePriority
+                    {
+                        Some(payload)
+                    } else {
+                        None
+                    };
+                    let force = local_corrupt;
+                    let _ = store
+                        .clone()
+                        .put(partition, address, store_fragment, local_payload, force)
+                        .await;
+                }
 
                 return Ok((fragment, buffer));
             }
