@@ -49,7 +49,7 @@ use super::super::storage_service::MAX_CHUNK_SIZE;
 use super::super::storage_service::auth::StorageClientAuth;
 use crate::connection::Connection;
 use crate::error::ProtocolError;
-use crate::public_read::StorageSessionStart;
+use crate::public_read::{AUTHORIZE_PUBLIC_READ_RESPONSE_CAPABILITY, StorageSessionStart};
 use crate::quic::client::CongestionAlgorithm;
 use crate::traits::Storage;
 
@@ -287,17 +287,16 @@ impl Storage for StorageClient {
         };
         let token_bytes = token.as_bytes();
 
-        // Build Authorize start payload:
-        // action(1=0) + repository_id(16) + corr_len(1) + corr(N) + token_len(2, u16 LE) + token(M)
         let corr_bytes = correlation_id.as_bytes();
         let mut payload =
-            BytesMut::with_capacity(1 + 16 + 1 + corr_bytes.len() + 2 + token_bytes.len());
-        payload.put_u8(0); // action = start
-        payload.extend_from_slice(repository.as_bytes());
+            BytesMut::with_capacity(1 + 16 + 1 + corr_bytes.len() + 2 + token_bytes.len() + 1);
+        payload.put_u8(0);
+        payload.put_slice(repository.as_bytes());
         payload.put_u8(corr_bytes.len() as u8);
-        payload.extend_from_slice(corr_bytes);
-        payload.extend_from_slice(&(token_bytes.len() as u16).to_le_bytes());
-        payload.extend_from_slice(token_bytes);
+        payload.put_slice(corr_bytes);
+        payload.put_slice(&(token_bytes.len() as u16).to_le_bytes());
+        payload.put_slice(token_bytes);
+        payload.put_u8(AUTHORIZE_PUBLIC_READ_RESPONSE_CAPABILITY);
         let payload = payload.freeze();
 
         let response = send_normal_with_reconnect(self, Command::Authorize, 0, || {
@@ -374,6 +373,13 @@ impl Storage for StorageClient {
         }
 
         let fragment = unsafe { payload.as_ptr().cast::<Fragment>().read_unaligned() };
+
+        if let Err(reason) = lore_base::types::validate_fragment_response(&fragment) {
+            return Err(ProtocolError::internal(format!(
+                "get_metadata: invalid fragment {fragment:?}: {reason}"
+            )));
+        }
+
         Ok(fragment)
     }
 

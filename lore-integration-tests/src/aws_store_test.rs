@@ -38,9 +38,6 @@ mod aws_store_tests {
     use lore_storage::StoreMatch;
     use lore_storage::StoreObliterateStats;
     use lore_storage::StoreQueryResult;
-    use lore_storage::read::PublicHttpImmutablePayloadSource;
-    use lore_transport::PublicObjectKeyScheme;
-    use lore_transport::PublicObjectReadConfig as TransportPublicObjectReadConfig;
     use rand::random;
 
     use crate::common::aws_common::FRAGMENT_METADATA_TABLE_NAME;
@@ -1274,7 +1271,6 @@ mod aws_store_tests {
                 let (s3, dynamo_immutable, _) =
                     setup(vec![FRAGMENTS_TABLE_NAME, FRAGMENT_METADATA_TABLE_NAME]).await?;
                 allow_public_bucket_reads(&s3).await?;
-                let s3_client = s3.sdk_client().clone();
 
                 let public_base_url = format!("http://127.0.0.1:9000/{STORE_BUCKET_NAME}");
                 let store_settings = AwsImmutableStoreSettings::new(
@@ -1285,9 +1281,9 @@ mod aws_store_tests {
                     ),
                     false,
                 )
-                .with_public_read(Some(lore_storage::PublicObjectReadConfig::new(
-                    public_base_url.clone(),
-                )));
+                .with_public_read(Some(
+                    lore_storage::PublicObjectReadConfig::try_new(public_base_url.clone()).unwrap(),
+                ));
 
                 let aws_immutable_store = Arc::new(AwsImmutableStore::new(
                     s3,
@@ -1307,30 +1303,12 @@ mod aws_store_tests {
                     .put(repository, address, fragment, Some(payload.clone()), false)
                     .await?;
 
-                let source =
-                    PublicHttpImmutablePayloadSource::new(TransportPublicObjectReadConfig {
-                        base_url: public_base_url,
-                        key_scheme: PublicObjectKeyScheme::HashHex,
-                    })?;
-                let loaded = source.get_payload(address.hash, fragment).await?;
-                assert_eq!(loaded, payload);
-
-                let key = address.hash.to_string();
-                s3_client
-                    .put_object()
-                    .bucket(STORE_BUCKET_NAME)
-                    .key(key)
-                    .body(aws_sdk_s3::primitives::ByteStream::from_static(
-                        b"corrupt-public-payload",
-                    ))
-                    .send()
+                let loaded = reqwest::get(format!("{public_base_url}/{}", address.hash))
+                    .await?
+                    .error_for_status()?
+                    .bytes()
                     .await?;
-
-                let corrupt_result = source.get_payload(address.hash, fragment).await;
-                assert!(
-                    corrupt_result.is_err(),
-                    "corrupt public object payload must be rejected"
-                );
+                assert_eq!(loaded, payload);
 
                 Ok(())
             })

@@ -548,12 +548,7 @@ pub async fn cache(
                             false,
                         )
                         .await
-                        .map_err(|err| {
-                            StoreError::internal_with_context(
-                                err,
-                                "Remote fragment prefetch failed",
-                            )
-                        })
+                        .map_err(crate::store::remote::storage_error_to_store_error)
                         .map(|(fragment, buffer)| (address, fragment, buffer))
                     });
 

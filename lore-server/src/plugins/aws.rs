@@ -29,7 +29,6 @@ use lore_revision::lock::LockStore;
 use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
 use lore_storage::PublicObjectReadConfig;
-use lore_storage::normalize_public_base_url;
 use opentelemetry_sdk::resource::ResourceDetector;
 use serde::Deserialize;
 use tracing::info;
@@ -195,20 +194,22 @@ fn public_read_config(
     if !enabled {
         return Ok(None);
     }
+
     let Some(base_url) = base_url else {
         return Err(PluginError::from(PluginConfigError {
             plugin_name: plugin_name.to_string(),
             message: "public_read_enabled=true requires public_read_base_url".to_string(),
         }));
     };
-    let base_url = normalize_public_base_url(base_url);
-    if base_url.is_empty() {
-        return Err(PluginError::from(PluginConfigError {
-            plugin_name: plugin_name.to_string(),
-            message: "public_read_base_url must not be empty".to_string(),
-        }));
-    }
-    Ok(Some(PublicObjectReadConfig { base_url }))
+
+    PublicObjectReadConfig::try_new(&base_url)
+        .map(Some)
+        .map_err(|err| {
+            PluginError::from(PluginConfigError {
+                plugin_name: plugin_name.to_string(),
+                message: format!("invalid public_read_base_url: {err}"),
+            })
+        })
 }
 
 // =============================================================================

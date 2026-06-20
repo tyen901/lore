@@ -42,12 +42,12 @@ mode = "local"
 
 # Local immutable store settings
 [immutable_store.local]
-path = "/home/tyen/lore-server-data"
+path = "/tmp/lore-server"
 flush_delay_seconds = 10
 
 # Local mutable store settings
 [mutable_store.local]
-path = "/home/tyen/lore-server-data"
+path = "/tmp/lore-server"
 flush_delay_seconds = 10
 
 # =============================================================================

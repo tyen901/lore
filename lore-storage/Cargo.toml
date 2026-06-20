@@ -33,6 +33,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
+url = { workspace = true }
 lore-error-set = { workspace = true }
 lore-telemetry = { workspace = true }
 uuid = { workspace = true, features = ["zerocopy"] }

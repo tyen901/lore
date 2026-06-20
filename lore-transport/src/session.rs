@@ -17,8 +17,6 @@ use tokio::task::JoinSet;
 
 use crate::connection::Connection;
 use crate::error::ProtocolError;
-use crate::public_read::ImmutablePayloadReadMode;
-use crate::public_read::PublicObjectReadConfig;
 use crate::public_read::StorageSessionStart;
 use crate::traits::Storage;
 
@@ -42,7 +40,7 @@ struct ResolvedFields {
     #[allow(dead_code)]
     connection: Arc<Connection>,
     session_id: u32,
-    immutable_payload_read: ImmutablePayloadReadMode,
+    public_read_base_url: Option<String>,
 }
 
 /// Closure signature for a pending session's resolver. The resolver runs at most
@@ -80,7 +78,7 @@ impl StorageSession {
                 storage,
                 connection,
                 session_id: start.session_id,
-                immutable_payload_read: start.immutable_payload_read,
+                public_read_base_url: start.public_read_base_url,
             }),
         }
     }
@@ -136,16 +134,14 @@ impl StorageSession {
         }
     }
 
-    /// Get the resolved `(storage, session_id, immutable_payload_read)` tuple, driving the pending
+    /// Get the resolved `(storage, session_id, public_read_base_url)` tuple, driving the pending
     /// resolver on first call. All operation methods go through here.
-    async fn ensure(
-        &self,
-    ) -> Result<(Arc<dyn Storage>, u32, ImmutablePayloadReadMode), ProtocolError> {
+    async fn ensure(&self) -> Result<(Arc<dyn Storage>, u32, Option<String>), ProtocolError> {
         match &self.inner {
             SessionInner::Resolved(r) => Ok((
                 r.storage.clone(),
                 r.session_id,
-                r.immutable_payload_read.clone(),
+                r.public_read_base_url.clone(),
             )),
             SessionInner::Pending { resolver, resolved } => {
                 // Single-writer initialization: the lock both serialises
@@ -167,7 +163,7 @@ impl StorageSession {
                     SessionInner::Resolved(r) => Ok((
                         r.storage.clone(),
                         r.session_id,
-                        r.immutable_payload_read.clone(),
+                        r.public_read_base_url.clone(),
                     )),
                     SessionInner::Pending { .. } => {
                         Err(ProtocolError::internal("nested pending session"))
@@ -240,14 +236,9 @@ impl StorageSession {
         storage.get_metadata(session_id, address).await
     }
 
-    pub async fn public_object_read_config(
-        &self,
-    ) -> Result<Option<PublicObjectReadConfig>, ProtocolError> {
-        let (_, _, mode) = self.ensure().await?;
-        Ok(match mode {
-            ImmutablePayloadReadMode::ServerStream => None,
-            ImmutablePayloadReadMode::PublicHttp(config) => Some(config),
-        })
+    pub async fn public_object_read_base_url(&self) -> Result<Option<String>, ProtocolError> {
+        let (_, _, public_read_base_url) = self.ensure().await?;
+        Ok(public_read_base_url)
     }
 
     pub async fn mutable_load(&self, key: &Hash, key_type: KeyType) -> Result<Hash, ProtocolError> {

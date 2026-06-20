@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 use bytes::Bytes;
 use lore_revision::lore::RepositoryId;
+use lore_transport::AUTHORIZE_PUBLIC_READ_RESPONSE_CAPABILITY;
 
 use crate::protocol::storage::messages::MessageParseError;
 
@@ -17,6 +18,7 @@ pub struct AuthorizeStart {
     pub repository: RepositoryId,
     pub correlation_id: String,
     pub auth_token: Vec<u8>,
+    pub public_read_response_supported: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -66,11 +68,16 @@ impl AuthorizeStart {
         };
 
         let auth_token = bytes.slice(token_start..token_start + token_len).to_vec();
+        let tail = bytes.slice(token_start + token_len..);
+        let public_read_response_supported = tail
+            .iter()
+            .any(|byte| *byte == AUTHORIZE_PUBLIC_READ_RESPONSE_CAPABILITY);
 
         Ok(Self {
             repository,
             correlation_id,
             auth_token,
+            public_read_response_supported,
         })
     }
 }
@@ -142,6 +149,18 @@ mod tests {
         assert_eq!(result.repository, repo);
         assert_eq!(result.correlation_id, "my-corr");
         assert_eq!(result.auth_token, b"my-token");
+        assert!(!result.public_read_response_supported);
+    }
+
+    #[test]
+    fn parse_start_public_read_response_capability() {
+        let repo = random::<RepositoryId>();
+        let mut payload = build_start_payload(repo, "my-corr", b"my-token").to_vec();
+        payload.push(AUTHORIZE_PUBLIC_READ_RESPONSE_CAPABILITY);
+
+        let result = AuthorizeStart::parse(Bytes::from(payload)).unwrap();
+
+        assert!(result.public_read_response_supported);
     }
 
     #[test]
