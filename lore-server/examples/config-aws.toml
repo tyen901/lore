@@ -48,6 +48,15 @@ dynamodb_timeout_millis = 15000
 # Force write mode for debugging/profiling purposes, always overwrites data already present
 # force_write = false
 
+# Optional direct public reads for immutable payload objects. When enabled,
+# read-only clients still resolve repositories, revisions, and metadata through
+# loreserver, but fetch missing payload objects from:
+#   {public_read_base_url}/{lowercase_hex_content_hash}
+# For Cloudflare R2 production deployments, use a custom domain for the public
+# bucket URL rather than r2.dev.
+# public_read_enabled = true
+# public_read_base_url = "https://objects.example.com"
+
 # Mutable store settings (DynamoDB)
 [plugins.aws.mutable_store]
 dynamodb_table = "urc-mutable"

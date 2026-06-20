@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
+use lore_storage::read::{load_remote_metadata, load_remote_raw_payload};
 use lore_transport::quic::storage_service::QueryStatus;
 use serde::Deserialize;
 use serde::Serialize;
@@ -132,12 +133,25 @@ async fn immutable_query_address(
         if let Some(raw_status) = result.first() {
             let status = QueryStatus::from(*raw_status);
 
-            let fragment = if status == QueryStatus::ExistFullMatch
-                && let Ok((fragment, payload)) = remote_storage.get(&address).await
-            {
-                maybe_fragment.replace(fragment);
-                maybe_payload.replace(payload);
-                fragment
+            let fragment = if status == QueryStatus::ExistFullMatch {
+                if recurse {
+                    if let Ok((fragment, payload)) =
+                        load_remote_raw_payload(remote_storage.as_ref(), address, false).await
+                    {
+                        maybe_fragment.replace(fragment);
+                        maybe_payload.replace(payload);
+                        fragment
+                    } else {
+                        Fragment::default()
+                    }
+                } else if let Ok(fragment) =
+                    load_remote_metadata(remote_storage.as_ref(), address).await
+                {
+                    maybe_fragment.replace(fragment);
+                    fragment
+                } else {
+                    Fragment::default()
+                }
             } else {
                 Fragment::default()
             };

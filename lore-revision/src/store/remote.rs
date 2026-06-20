@@ -8,6 +8,7 @@ use bytes::Bytes;
 use lore_error_set::Internal;
 use lore_error_set::prelude::*;
 use lore_storage::immutable_store::sanitise_fragment_behavior_flags;
+use lore_storage::read::{load_remote_metadata, load_remote_raw_payload};
 use lore_transport::Admin;
 use lore_transport::Connection;
 use lore_transport::ProtocolError;
@@ -17,6 +18,7 @@ use tokio::sync::Mutex;
 use super::StoreObliterateStats;
 use crate::error::LoreResultExt;
 use crate::errors::AddressNotFound;
+use crate::errors::Disconnected;
 use crate::lore::Address;
 use crate::lore::Context;
 use crate::lore::Fragment;
@@ -32,6 +34,24 @@ use crate::store::KeyValueStream;
 use crate::store::StoreError;
 use crate::store::StoreMatch;
 use crate::store::StoreQueryResult;
+
+pub(crate) fn storage_error_to_store_error(err: lore_storage::StorageError) -> StoreError {
+    match err {
+        lore_storage::StorageError::AddressNotFound(err) => StoreError::from(err.into_inner()),
+        lore_storage::StorageError::PayloadNotFound(err) => StoreError::from(err.into_inner()),
+        lore_storage::StorageError::SlowDown(err) => StoreError::from(err.into_inner()),
+        lore_storage::StorageError::Oversized(err) => StoreError::from(err.into_inner()),
+        lore_storage::StorageError::NotFound(err) => StoreError::from(err.into_inner()),
+        lore_storage::StorageError::Disconnected(err) => StoreError::from(err.into_inner()),
+        lore_storage::StorageError::NotAuthorized(err) => StoreError::from(err.into_inner()),
+        lore_storage::StorageError::NotAuthenticated(err) => StoreError::from(err.into_inner()),
+        lore_storage::StorageError::Maintenance(err) => StoreError::from(err.into_inner()),
+        lore_storage::StorageError::NoRemote(err) => StoreError::from(err.into_inner()),
+        lore_storage::StorageError::NotSupported(err) => StoreError::from(err.into_inner()),
+        lore_storage::StorageError::NotConnected(_) => StoreError::from(Disconnected),
+        other => StoreError::internal_with_context(other, "remote storage error"),
+    }
+}
 
 pub struct RemoteImmutableStore {
     /// Remote address
@@ -191,10 +211,9 @@ impl store::ImmutableStore for RemoteImmutableStore {
         let session = self.session(repository).await?;
         let status = session.query(&[address]).await.unwrap_or_default();
         if !status.is_empty() && status[0] == 0 {
-            let (fragment, _payload) = session
-                .get(&address)
+            let fragment = load_remote_metadata(session.as_ref(), address)
                 .await
-                .forward::<StoreError>("Remote store query failed")?;
+                .map_err(storage_error_to_store_error)?;
             Ok(StoreQueryResult {
                 fragment,
                 match_made: StoreMatch::MatchFull,
@@ -215,10 +234,9 @@ impl store::ImmutableStore for RemoteImmutableStore {
     ) -> Result<(Fragment, Bytes), StoreError> {
         let repository: RepositoryId = repository;
         let session = self.session(repository).await?;
-        let (fragment, payload) = session
-            .get(&address)
+        let (fragment, payload) = load_remote_raw_payload(session.as_ref(), address, false)
             .await
-            .forward::<StoreError>("Remote store get failed")?;
+            .map_err(storage_error_to_store_error)?;
         lore_storage::validate_fragment_payload(&fragment, payload.len())?;
         Ok((fragment, payload))
     }

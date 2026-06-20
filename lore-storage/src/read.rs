@@ -26,6 +26,7 @@ use crate::hash;
 use crate::immutable_store::ImmutableStore;
 use crate::immutable_store::StoreError;
 use crate::options::ReadOptions;
+use crate::public_read::fetch_public_hash_payload;
 use crate::store_types::StoreMatch;
 use crate::types::Address;
 use crate::types::Fragment;
@@ -193,6 +194,49 @@ async fn remote_get_retry(
     }
 }
 
+async fn remote_get_metadata_retry(
+    session: &StorageSession,
+    address: Address,
+) -> Result<Fragment, StorageError> {
+    let _guard = RemoteFetchGuard::new();
+    let mut retry = store_retry();
+    let mut stale_session_retries: u32 = 0;
+
+    loop {
+        debug_assert!(
+            !address.hash.is_zero(),
+            "Cannot request zero hash from store"
+        );
+
+        match session.get_metadata(&address).await {
+            Ok(fragment) => return Ok(fragment),
+            Err(ref err) if err.is_slow_down() => {
+                if !retry.wait().await {
+                    return Err(StorageError::from(SlowDown));
+                }
+            }
+            Err(err) => {
+                let storage_err = crate::error::protocol_error_to_storage(err, address);
+
+                if matches!(storage_err, StorageError::NotConnected(_))
+                    && stale_session_retries < MAX_STALE_SESSION_RETRIES
+                {
+                    stale_session_retries += 1;
+                    session.invalidate().await;
+
+                    if !retry.wait().await {
+                        return Err(storage_err);
+                    }
+
+                    continue;
+                }
+
+                return Err(storage_err);
+            }
+        }
+    }
+}
+
 /// Bound on retries for `StorageError::NotConnected` in `remote_get_retry`.
 /// Picked so a genuinely permanent server-side failure surfaces quickly
 /// rather than looping through the full `store_retry` backoff schedule (60
@@ -200,6 +244,45 @@ async fn remote_get_retry(
 /// succeeds on the first or second retry once the session has been
 /// re-established.
 const MAX_STALE_SESSION_RETRIES: u32 = 5;
+
+pub async fn load_remote_metadata(
+    session: &StorageSession,
+    address: Address,
+) -> Result<Fragment, StorageError> {
+    let mut fragment = remote_get_metadata_retry(session, address).await?;
+    fragment.flags |= FragmentFlags::PayloadStoredDurable;
+    Ok(fragment)
+}
+
+/// Load a raw fragment payload from a remote session, using public object-store
+/// reads when the session advertises them and server streaming only otherwise.
+pub async fn load_remote_raw_payload(
+    session: &StorageSession,
+    address: Address,
+    priority: bool,
+) -> Result<(Fragment, Bytes), StorageError> {
+    if let Some(public_read_base_url) = session
+        .public_object_read_base_url()
+        .await
+        .map_err(|err| crate::error::protocol_error_to_storage(err, address))?
+    {
+        lore_base::lore_trace!(
+            "Fetch immutable fragment {} from public object store",
+            address
+        );
+        let mut fragment = remote_get_metadata_retry(session, address).await?;
+        fragment.flags |= FragmentFlags::PayloadStoredDurable;
+
+        let payload =
+            fetch_public_hash_payload(&public_read_base_url, address.hash, fragment).await?;
+
+        return Ok((fragment, payload));
+    }
+
+    let (mut fragment, payload) = remote_get_retry(session, address, priority).await?;
+    fragment.flags |= FragmentFlags::PayloadStoredDurable;
+    Ok((fragment, payload))
+}
 
 /// Unified fragment load: local -> decompress/verify -> optional remote fallback -> heal -> cache.
 ///
@@ -303,12 +386,54 @@ pub async fn load_fragment(
     let mut options = options;
     options.verify |= local_corrupt;
 
+    let public_read_mode = session
+        .public_object_read_base_url()
+        .await
+        .map_err(|err| crate::error::protocol_error_to_storage(err, address))?
+        .is_some();
+
     let mut heal_attempted = false;
     loop {
-        let (mut fragment, buffer) =
-            remote_get_retry(session.as_ref(), address, options.priority).await?;
+        let remote_result =
+            load_remote_raw_payload(session.as_ref(), address, options.priority).await;
 
-        fragment.flags |= FragmentFlags::PayloadStoredDurable;
+        let (fragment, buffer) = match remote_result {
+            Ok(value) => value,
+            Err(err)
+                if public_read_mode
+                    && !heal_attempted
+                    && matches!(
+                        err,
+                        StorageError::AddressNotFound(_)
+                            | StorageError::PayloadNotFound(_)
+                            | StorageError::Internal(_)
+                    ) =>
+            {
+                lore_base::lore_warn!(
+                    "Public immutable payload {} could not be loaded: {}. Attempting server heal.",
+                    address.hash,
+                    err
+                );
+
+                let healed = session
+                    .verify(&address, true)
+                    .await
+                    .is_ok_and(|result| result.healed == lore_base::types::HealResult::Healed);
+
+                if !healed {
+                    lore_base::lore_error!(
+                        "Server did not heal public immutable payload {}",
+                        address.hash
+                    );
+                    return Err(err);
+                }
+
+                heal_attempted = true;
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+
         let store_fragment = fragment;
         let payload = buffer.clone();
 

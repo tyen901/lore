@@ -31,6 +31,7 @@ use lore_revision::lore_warn;
 use lore_revision::util::task_queue::METRICS_TASK_QUEUE_LABEL;
 use lore_revision::util::task_queue::TaskQueue;
 use lore_storage::ImmutableStore as ImmutableStoreTrait;
+use lore_storage::PublicObjectReadConfig;
 use lore_storage::StoreError;
 use lore_storage::StoreMatch;
 use lore_storage::StoreObliterateStats;
@@ -200,6 +201,8 @@ pub struct AwsImmutableStoreSettings {
     pub s3: S3StoreSettings,
     pub dynamodb: DynamoDbImmutableStoreSettings,
     #[serde(default)]
+    pub public_read: Option<PublicObjectReadConfig>,
+    #[serde(default)]
     pub force_write: bool,
     #[serde(default = "default_submission_limit")]
     pub batch_exist_submission_limit: usize,
@@ -214,9 +217,15 @@ impl AwsImmutableStoreSettings {
         Self {
             s3,
             dynamodb,
+            public_read: None,
             force_write,
             batch_exist_submission_limit: default_submission_limit(),
         }
+    }
+
+    pub fn with_public_read(mut self, public_read: Option<PublicObjectReadConfig>) -> Self {
+        self.public_read = public_read;
+        self
     }
 }
 
@@ -340,6 +349,7 @@ pub struct AwsImmutableStore {
     dynamodb: DynamoDb,
     task_queue: TaskQueue<BatchTaskResult>,
     bucket: String,
+    public_read: Option<PublicObjectReadConfig>,
     fragments_table_name: Arc<str>,
     metadata_table_name: Arc<str>,
     force_write: bool,
@@ -379,6 +389,7 @@ impl AwsImmutableStore {
                 )],
             ),
             bucket: settings.s3.bucket.clone(),
+            public_read: settings.public_read.clone(),
             fragments_table_name: Arc::from(settings.dynamodb.fragments_table_name.clone()),
             metadata_table_name: Arc::from(settings.dynamodb.metadata_table_name.clone()),
             force_write: settings.force_write,
@@ -1197,6 +1208,10 @@ impl AwsImmutableStore {
 
 #[async_trait]
 impl ImmutableStoreTrait for AwsImmutableStore {
+    fn public_object_read_config(&self) -> Option<PublicObjectReadConfig> {
+        self.public_read.clone()
+    }
+
     #[lore_macro::lore_instrument]
     #[tracing::instrument(name= "AwsImmutableStore::exists" skip(self))]
     async fn exist(
@@ -1781,6 +1796,7 @@ mod test {
             ),
             force_write: false,
             batch_exist_submission_limit: 1000,
+            public_read: None,
         };
 
         let execution = setup_execution("test".to_string());

@@ -56,6 +56,30 @@ mod aws_store_tests {
         key
     }
 
+    async fn allow_public_bucket_reads(
+        s3: &lore_aws::s3::S3,
+    ) -> Result<(), Box<dyn Error + 'static>> {
+        let policy = serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": ["s3:GetObject"],
+                "Resource": format!("arn:aws:s3:::{STORE_BUCKET_NAME}/*")
+            }]
+        })
+        .to_string();
+
+        s3.sdk_client()
+            .put_bucket_policy()
+            .bucket(STORE_BUCKET_NAME)
+            .policy(policy)
+            .send()
+            .await?;
+
+        Ok(())
+    }
+
     #[derive(Default)]
     struct LocalStore {
         local_exists_addresses: Vec<Address>,
@@ -1230,6 +1254,61 @@ mod aws_store_tests {
                 expected.sort_by_key(|(k, _)| *k);
                 results.sort_by_key(|(k, _)| *k);
                 assert_eq!(results, expected);
+
+                Ok(())
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn public_http_reads_payload_written_by_aws_immutable_store() -> TestResult {
+        let repository = random::<RepositoryId>();
+        let (fragment, address, payload) = fragment::generate_random();
+
+        let execution = setup_execution("test".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let (s3, dynamo_immutable, _) =
+                    setup(vec![FRAGMENTS_TABLE_NAME, FRAGMENT_METADATA_TABLE_NAME]).await?;
+                allow_public_bucket_reads(&s3).await?;
+
+                let public_base_url = format!("http://127.0.0.1:9000/{STORE_BUCKET_NAME}");
+                let store_settings = AwsImmutableStoreSettings::new(
+                    S3StoreSettings::new(STORE_BUCKET_NAME.to_string()),
+                    DynamoDbImmutableStoreSettings::new(
+                        FRAGMENTS_TABLE_NAME.to_string(),
+                        FRAGMENT_METADATA_TABLE_NAME.to_string(),
+                    ),
+                    false,
+                )
+                .with_public_read(Some(
+                    lore_storage::PublicObjectReadConfig::try_new(public_base_url.clone()).unwrap(),
+                ));
+
+                let aws_immutable_store = Arc::new(AwsImmutableStore::new(
+                    s3,
+                    dynamo_immutable,
+                    &store_settings,
+                ));
+                assert_eq!(
+                    aws_immutable_store
+                        .public_object_read_config()
+                        .expect("public read config")
+                        .base_url,
+                    public_base_url
+                );
+
+                aws_immutable_store
+                    .clone()
+                    .put(repository, address, fragment, Some(payload.clone()), false)
+                    .await?;
+
+                let loaded = reqwest::get(format!("{public_base_url}/{}", address.hash))
+                    .await?
+                    .error_for_status()?
+                    .bytes()
+                    .await?;
+                assert_eq!(loaded, payload);
 
                 Ok(())
             })

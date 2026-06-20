@@ -54,6 +54,7 @@ use crate::connection::RECONNECT_MAX_ATTEMPTS;
 use crate::connection::RECONNECT_MAX_DELAY;
 use crate::connection::RECONNECT_START_DELAY;
 use crate::error::ProtocolError;
+use crate::public_read::StorageSessionStart;
 use crate::traits::*;
 use crate::types::*;
 
@@ -987,7 +988,7 @@ impl Storage for GRPCStorage {
         &self,
         repository: RepositoryId,
         correlation_id: &str,
-    ) -> Result<u32, ProtocolError> {
+    ) -> Result<StorageSessionStart, ProtocolError> {
         let auth = self
             .connection
             .repository_authz(&self.auth_url, &self.identity, repository)
@@ -1005,7 +1006,7 @@ impl Storage for GRPCStorage {
                 auth_token: token,
             },
         );
-        Ok(session_id)
+        Ok(StorageSessionStart::server_stream(session_id))
     }
 
     async fn session_stop(&self, session_id: u32) -> Result<(), ProtocolError> {

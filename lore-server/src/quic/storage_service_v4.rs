@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
+use lore_transport::StorageSessionStart;
 use lore_transport::quic::QuicOpCode;
 use lore_transport::quic::QuicServiceError;
 use lore_transport::quic::UnknownCommand;
@@ -57,6 +58,7 @@ pub enum ParsedStorageRequestV4 {
         repository: lore_revision::lore::RepositoryId,
         correlation_id: String,
         auth_token: Vec<u8>,
+        public_read_response_supported: bool,
     },
     AuthorizeStop {
         session_id: u32,
@@ -138,6 +140,7 @@ impl QuicService for StorageServiceV4 {
                     repository: start.repository,
                     correlation_id: start.correlation_id,
                     auth_token: start.auth_token,
+                    public_read_response_supported: start.public_read_response_supported,
                 }),
                 AuthorizeAction::Stop(stop) => Ok(ParsedStorageRequestV4::AuthorizeStop {
                     session_id: stop.session_id,
@@ -167,6 +170,7 @@ impl QuicService for StorageServiceV4 {
                 repository,
                 correlation_id,
                 auth_token,
+                public_read_response_supported,
             } => {
                 let mut user_id = String::new();
 
@@ -201,7 +205,24 @@ impl QuicService for StorageServiceV4 {
                             correlation_id,
                             "Authorized session"
                         );
-                        let response_data = vec![Bytes::copy_from_slice(&session_id.to_le_bytes())];
+                        let start = if public_read_response_supported {
+                            if let Some(config) = self.immutable_store.public_object_read_config() {
+                                StorageSessionStart::public_http_hash_hex(
+                                    session_id,
+                                    config.base_url,
+                                )
+                            } else {
+                                StorageSessionStart::server_stream(session_id)
+                            }
+                        } else {
+                            StorageSessionStart::server_stream(session_id)
+                        };
+                        let response_data = vec![start.encode_quic_v4().map_err(|err| {
+                            tracing::warn!(
+                                "failed to encode storage session_start response: {err}"
+                            );
+                            MessageHandleError::InternalError
+                        })?];
                         Ok(response_data)
                     }
                     Err(SessionError::LimitReached) => Err(MessageHandleError::SessionLimitReached),
@@ -482,6 +503,7 @@ mod tests {
                         repository: repo,
                         correlation_id: format!("fill-{i}"),
                         auth_token: vec![],
+                        public_read_response_supported: false,
                     },
                 )
                 .await;
@@ -496,6 +518,7 @@ mod tests {
                     repository: repo,
                     correlation_id: "over-limit".into(),
                     auth_token: vec![],
+                    public_read_response_supported: false,
                 },
             )
             .await

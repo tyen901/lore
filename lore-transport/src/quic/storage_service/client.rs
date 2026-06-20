@@ -49,6 +49,7 @@ use super::super::storage_service::MAX_CHUNK_SIZE;
 use super::super::storage_service::auth::StorageClientAuth;
 use crate::connection::Connection;
 use crate::error::ProtocolError;
+use crate::public_read::{AUTHORIZE_PUBLIC_READ_RESPONSE_CAPABILITY, StorageSessionStart};
 use crate::quic::client::CongestionAlgorithm;
 use crate::traits::Storage;
 
@@ -270,7 +271,7 @@ impl Storage for StorageClient {
         &self,
         repository: RepositoryId,
         correlation_id: &str,
-    ) -> Result<u32, ProtocolError> {
+    ) -> Result<StorageSessionStart, ProtocolError> {
         // Fetch auth token via token exchange (cached if already exchanged)
         let token = if !self.auth_url.is_empty() {
             let (_, authorization_token, _) = crate::auth::exchange::auth_exchange(
@@ -290,13 +291,14 @@ impl Storage for StorageClient {
         // action(1=0) + repository_id(16) + corr_len(1) + corr(N) + token_len(2, u16 LE) + token(M)
         let corr_bytes = correlation_id.as_bytes();
         let mut payload =
-            BytesMut::with_capacity(1 + 16 + 1 + corr_bytes.len() + 2 + token_bytes.len());
+            BytesMut::with_capacity(1 + 16 + 1 + corr_bytes.len() + 2 + token_bytes.len() + 1);
         payload.put_u8(0); // action = start
         payload.extend_from_slice(repository.as_bytes());
         payload.put_u8(corr_bytes.len() as u8);
         payload.extend_from_slice(corr_bytes);
         payload.extend_from_slice(&(token_bytes.len() as u16).to_le_bytes());
         payload.extend_from_slice(token_bytes);
+        payload.put_u8(AUTHORIZE_PUBLIC_READ_RESPONSE_CAPABILITY);
         let payload = payload.freeze();
 
         let response = send_normal_with_reconnect(self, Command::Authorize, 0, || {
@@ -304,15 +306,7 @@ impl Storage for StorageClient {
         })
         .await?;
 
-        if response.len() != 4 {
-            return Err(ProtocolError::internal(format!(
-                "session_start: expected 4-byte response, got {} bytes",
-                response.len()
-            )));
-        }
-
-        let session_id = u32::from_le_bytes(response[..4].try_into().unwrap());
-        Ok(session_id)
+        StorageSessionStart::decode_quic_v4(&response)
     }
 
     async fn session_stop(&self, session_id: u32) -> Result<(), ProtocolError> {
@@ -381,6 +375,13 @@ impl Storage for StorageClient {
         }
 
         let fragment = unsafe { payload.as_ptr().cast::<Fragment>().read_unaligned() };
+
+        if let Err(reason) = lore_base::types::validate_fragment_response(&fragment) {
+            return Err(ProtocolError::internal(format!(
+                "get_metadata: invalid fragment {fragment:?}: {reason}"
+            )));
+        }
+
         Ok(fragment)
     }
 

@@ -28,6 +28,7 @@ use lore_base::runtime::runtime;
 use lore_revision::lock::LockStore;
 use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
+use lore_storage::PublicObjectReadConfig;
 use opentelemetry_sdk::resource::ResourceDetector;
 use serde::Deserialize;
 use tracing::info;
@@ -100,6 +101,15 @@ pub struct AwsImmutableStorePluginConfig {
     /// non-AWS hostnames like `MinIO` in Docker).
     #[serde(default)]
     pub s3_force_path_style: bool,
+
+    /// Enable direct public HTTP reads for immutable payload objects.
+    #[serde(default)]
+    pub public_read_enabled: bool,
+
+    /// Public base URL for direct immutable payload reads. Object URLs are
+    /// `{public_read_base_url}/{hash_hex}`.
+    #[serde(default)]
+    pub public_read_base_url: Option<String>,
 }
 
 /// Configuration for the AWS mutable store plugin.
@@ -176,6 +186,32 @@ fn default_timeout() -> u64 {
     5000
 }
 
+fn public_read_config(
+    plugin_name: &str,
+    enabled: bool,
+    base_url: Option<String>,
+) -> Result<Option<PublicObjectReadConfig>, PluginError> {
+    if !enabled {
+        return Ok(None);
+    }
+
+    let Some(base_url) = base_url else {
+        return Err(PluginError::from(PluginConfigError {
+            plugin_name: plugin_name.to_string(),
+            message: "public_read_enabled=true requires public_read_base_url".to_string(),
+        }));
+    };
+
+    PublicObjectReadConfig::try_new(&base_url)
+        .map(Some)
+        .map_err(|err| {
+            PluginError::from(PluginConfigError {
+                plugin_name: plugin_name.to_string(),
+                message: format!("invalid public_read_base_url: {err}"),
+            })
+        })
+}
+
 // =============================================================================
 // Plugin Factory Implementations
 // =============================================================================
@@ -195,13 +231,18 @@ impl ImmutableStorePluginFactory for AwsImmutableStorePluginFactory {
         let plugin_name = self.name();
 
         // Deserialize and validate configuration without creating AWS clients
-        let _plugin_config: AwsImmutableStorePluginConfig =
+        let plugin_config: AwsImmutableStorePluginConfig =
             config.clone().try_into().map_err(|e| {
                 PluginError::from(PluginConfigError {
                     plugin_name: plugin_name.to_string(),
                     message: format!("Failed to deserialize AWS immutable store config: {e}"),
                 })
             })?;
+        let _ = public_read_config(
+            plugin_name,
+            plugin_config.public_read_enabled,
+            plugin_config.public_read_base_url,
+        )?;
 
         Ok(())
     }
@@ -311,11 +352,18 @@ impl ImmutableStorePluginFactory for AwsImmutableStorePluginFactory {
             timeout_millis: plugin_config.timeout_millis,
         };
 
+        let public_read = public_read_config(
+            plugin_name,
+            plugin_config.public_read_enabled,
+            plugin_config.public_read_base_url.clone(),
+        )?;
+
         let store_settings = AwsImmutableStoreSettings::new(
             s3_settings,
             dynamodb_settings,
             plugin_config.force_write,
-        );
+        )
+        .with_public_read(public_read);
 
         let store = AwsImmutableStore::new(s3_client, dynamodb_client, &store_settings);
 
@@ -642,6 +690,8 @@ mod tests {
             dynamodb_slow_operation_threshold_millis = 500
             timeout_millis = 3000
             force_write = true
+            public_read_enabled = true
+            public_read_base_url = "https://objects.example.com/"
         "#;
 
         let config: toml::Value = toml::from_str(config_str).unwrap();
@@ -664,6 +714,11 @@ mod tests {
         assert_eq!(plugin_config.dynamodb_slow_operation_threshold_millis, 500);
         assert_eq!(plugin_config.timeout_millis, 3000);
         assert!(plugin_config.force_write);
+        assert!(plugin_config.public_read_enabled);
+        assert_eq!(
+            plugin_config.public_read_base_url,
+            Some("https://objects.example.com/".to_string())
+        );
     }
 
     #[tokio::test]
@@ -691,6 +746,59 @@ mod tests {
         );
         assert_eq!(plugin_config.timeout_millis, 5000);
         assert!(!plugin_config.force_write);
+        assert!(!plugin_config.public_read_enabled);
+        assert!(plugin_config.public_read_base_url.is_none());
+    }
+
+    #[test]
+    fn public_read_config_normalizes_base_url() {
+        let config = public_read_config(
+            PLUGIN_NAME,
+            true,
+            Some("https://objects.example.com///".to_string()),
+        )
+        .expect("public read config")
+        .expect("public read enabled");
+
+        assert_eq!(config.base_url, "https://objects.example.com");
+    }
+
+    #[test]
+    fn public_read_config_requires_base_url_when_enabled() {
+        let err = public_read_config(PLUGIN_NAME, true, None).expect_err("missing base URL");
+        let config_err = err
+            .as_plugin_config_error()
+            .expect("should be PluginConfigError");
+
+        assert_eq!(config_err.plugin_name, PLUGIN_NAME);
+        assert!(
+            config_err.message.contains("public_read_base_url"),
+            "error should mention public_read_base_url, got {}",
+            config_err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_config_rejects_enabled_public_read_without_base_url() {
+        let factory = AwsImmutableStorePluginFactory;
+        let config: toml::Value = toml::from_str(
+            r#"
+            s3_bucket = "test-bucket"
+            dynamodb_fragments_table = "fragments"
+            dynamodb_metadata_table = "metadata"
+            public_read_enabled = true
+        "#,
+        )
+        .unwrap();
+
+        let err = factory
+            .validate_config(&config)
+            .expect_err("public read without base URL should fail");
+        let config_err = err
+            .as_plugin_config_error()
+            .expect("should be PluginConfigError");
+
+        assert!(config_err.message.contains("public_read_base_url"));
     }
 
     #[tokio::test]
